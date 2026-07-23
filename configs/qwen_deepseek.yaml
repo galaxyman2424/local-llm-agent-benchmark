@@ -1,0 +1,14 @@
+name: qwen_deepseek
+
+reasoner:
+  model: qwen3.5:9b
+
+actioner:
+  model: deepseek-coder-v2:16b-instruct-q4_0
+
+agent:
+  max_iterations: 10
+  timeout: 600
+
+benchmark:
+  name: swebench_lite

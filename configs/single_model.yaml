@@ -1,0 +1,14 @@
+name: single_model_qwen35_9b
+
+reasoner:
+  model: qwen3.5:9b
+
+actioner:
+  model: qwen3.5:9b
+
+agent:
+  max_iterations: 10
+  timeout: 600
+
+benchmark:
+  name: swebench_lite

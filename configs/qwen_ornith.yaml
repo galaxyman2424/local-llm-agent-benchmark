@@ -1,0 +1,14 @@
+name: qwen_ornith
+
+reasoner:
+  model: qwen3.5:9b
+
+actioner:
+  model: ornith:9b
+
+agent:
+  max_iterations: 10
+  timeout: 600
+
+benchmark:
+  name: swebench_lite
