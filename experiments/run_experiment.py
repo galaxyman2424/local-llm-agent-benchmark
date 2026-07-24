@@ -4,9 +4,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 import traceback
 from pathlib import Path
+
+# Make the project root importable regardless of the current working
+# directory or how this script was invoked -- `python script.py` only adds
+# the script's own directory to sys.path, not the project root, so
+# `from swebench.utils import ...` / `from agents import ...` etc. would
+# otherwise raise ModuleNotFoundError.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def load_config(config_path: str) -> dict:
@@ -23,6 +31,9 @@ def run_experiment(
     seed_repos_dir: str = "seed_repos/swe_bench_lite",
     results_raw_dir: str = "results/raw",
     results_processed_dir: str = "results/processed",
+    reasoner_model: str | None = None,
+    actioner_model: str | None = None,
+    run_name: str | None = None,
 ) -> dict:
     """Run a complete experiment based on the given config.
 
@@ -38,7 +49,9 @@ def run_experiment(
     Parameters
     ----------
     config_path : str
-        Path to the YAML configuration file.
+        Path to the YAML configuration file. Still used for agent/benchmark
+        settings (max_iterations, etc.) even if reasoner_model/actioner_model
+        override the model names it specifies.
     limit : int | None
         Number of instances to evaluate. If None, all instances are run.
     seed_repos_dir : str
@@ -47,6 +60,16 @@ def run_experiment(
         Where per-instance raw results are saved.
     results_processed_dir : str
         Where aggregated summaries are saved.
+    reasoner_model : str | None
+        If given, overrides the config file's reasoner model (useful for
+        grid-searching many reasoner/actioner pairings without writing a
+        YAML file per combination).
+    actioner_model : str | None
+        Same as above, for the actioner model.
+    run_name : str | None
+        If given, used as the summary filename stem instead of the config
+        file's stem -- needed so multiple combinations sharing one base
+        config don't overwrite each other's summary.json.
 
     Returns
     -------
@@ -64,16 +87,18 @@ def run_experiment(
 
     # Load dataset for instance selection
     from swebench.utils import load_dataset, find_repo_path
-    dataset = load_dataset(str(seed_repos_dir))
-    print(f"[Experiment] Loaded {len(dataset)} instances from dataset")
+    dataset_list = load_dataset(str(seed_repos_dir / "dataset.jsonl"))
+    dataset = {"instances": {inst.get("instance_id", f"instance_{i}"): inst for i, inst in enumerate(dataset_list)}}
+    print(f"[Experiment] Loaded {len(dataset_list)} instances from dataset")
 
-    # Initialize agents
+    # Initialize agents (explicit overrides win over the config file)
     from agents import Reasoner, Actioner, Agent
-    reasoner_model = config.get("reasoner", {}).get("model", "qwen3.5:9b")
-    actioner_model = config.get("actioner", {}).get("model", "ornith:9b")
+    reasoner_model = reasoner_model or config.get("reasoner", {}).get("model", "qwen3.5:9b")
+    actioner_model = actioner_model or config.get("actioner", {}).get("model", "ornith:9b")
 
     print(f"[Experiment] Initializing Reasoner (model={reasoner_model})...")
-    reasoner = Reasoner(model_id=reasoner_model)
+    reasoner_timeout = config.get("agent", {}).get("timeout", 120.0)
+    reasoner = Reasoner(model_id=reasoner_model, timeout_seconds=reasoner_timeout)
 
     print(f"[Experiment] Initializing Actioner (model={actioner_model})...")
     actioner = Actioner(model_id=actioner_model)
@@ -149,19 +174,29 @@ def run_experiment(
 
     # Save aggregated summary
     from benchmarks.swebench import InstanceRecord
-    passed = sum(1 for r in results if isinstance(r, InstanceRecord) and r.status == "passed")
+    resolved = sum(1 for r in results if isinstance(r, InstanceRecord) and r.status == "resolved")
     total = len(selected_instances)
     error_count = sum(1 for r in results if not isinstance(r, InstanceRecord))
+    by_status: dict[str, int] = {}
+    for r in results:
+        if isinstance(r, InstanceRecord):
+            by_status[r.status] = by_status.get(r.status, 0) + 1
 
     summary = {
         "experiment_config": config_path,
+        "reasoner_model": reasoner_model,
+        "actioner_model": actioner_model,
         "total_instances": total,
-        "completed": passed,
+        "resolved": resolved,
+        "resolve_rate": resolved / total if total else 0.0,
+        "by_status": by_status,
         "errors": error_count,
         "run_time_seconds": round(run_time, 2),
     }
 
-    summary_path = results_processed_dir / f"{config_path.split('/')[-1]}.json"
+    results_processed_dir.mkdir(parents=True, exist_ok=True)
+    summary_stem = run_name or Path(config_path).stem
+    summary_path = results_processed_dir / f"{summary_stem}.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -174,7 +209,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a complete experiment from config file")
     parser.add_argument("--config", type=str, default="configs/qwen_ornith.yaml")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--reasoner-model", type=str, default=None, help="Override the config's reasoner model")
+    parser.add_argument("--actioner-model", type=str, default=None, help="Override the config's actioner model")
+    parser.add_argument("--run-name", type=str, default=None, help="Summary filename stem (default: config file stem)")
     args = parser.parse_args()
 
-    result = run_experiment(config_path=args.config, limit=args.limit)
+    result = run_experiment(
+        config_path=args.config,
+        limit=args.limit,
+        reasoner_model=args.reasoner_model,
+        actioner_model=args.actioner_model,
+        run_name=args.run_name,
+    )
     print(json.dumps(result, indent=2))

@@ -14,9 +14,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# See experiments/run_experiment.py for why this is needed.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 @dataclass
@@ -36,6 +41,12 @@ class RunResult:
     test_results: dict = field(default_factory=dict)
     final_patch: str = ""
     status: str = "incomplete"
+    fail_to_pass_count: int = 0
+    fail_to_pass_total: int = 0
+    pass_to_pass_count: int = 0
+    pass_to_pass_total: int = 0
+    fail_to_pass_results: dict = field(default_factory=dict)
+    pass_to_pass_results: dict = field(default_factory=dict)
 
 
 def run_instance(
@@ -88,11 +99,28 @@ def run_instance(
 
     # 4. Create an isolated workspace for this instance
     from swebench.utils import create_workspace as _create_ws
-    workspace_dir = _create_ws(repo_path, instance_id)
+    workspace_dir = _create_ws(repo_path, instance_id, base_commit=base_commit)
 
-    # 5. Initialize the agent with the problem statement
-    # In a full implementation, this would spin up the Reasoner+Actioner loop.
-    # For now we record metadata and prepare for evaluation.
+    # Install the repo's dependencies into a venv shared across this repo's
+    # instances (created once, reused), but editable-install the package
+    # from workspace_dir specifically so tests import this instance's own
+    # edited files, not a stale copy from the shared repo_path.
+    from swebench.utils import ensure_repo_environment
+    python_bin = ensure_repo_environment(repo_path, install_path=workspace_dir)
+
+    # 5. Initialize the agent and give it the problem statement
+    from agents import Reasoner, Actioner, Agent
+
+    reasoner_model = agent_config.get("reasoner_model") or agent_config.get("reasoner", {}).get("model", "qwen2.5:7b")
+    actioner_model = agent_config.get("actioner_model") or agent_config.get("actioner", {}).get("model", reasoner_model)
+    max_iterations = agent_config.get("max_iterations") or agent_config.get("agent", {}).get("max_iterations", 50)
+    test_cmd = instance.get("test_command", "pytest")
+
+    reasoner_timeout = agent_config.get("timeout") or agent_config.get("agent", {}).get("timeout", 120.0)
+    reasoner = Reasoner(model_id=reasoner_model, timeout_seconds=reasoner_timeout)
+    actioner = Actioner(model_id=actioner_model, workspace_dir=str(workspace_dir))
+    agent = Agent(reasoner, actioner, max_iterations=max_iterations)
+
     start_time = time.time()
 
     result = RunResult(
@@ -100,48 +128,60 @@ def run_instance(
         repo_name=repo_name,
         base_commit=base_commit,
         agent_config=agent_config,
-        reasoner_model=agent_config.get("reasoner_model", ""),
-        actioner_model=agent_config.get("actioner_model", ""),
+        reasoner_model=reasoner_model,
+        actioner_model=actioner_model,
         start_time=start_time,
     )
 
-    # 6. Capture any final patch (placeholder — real impl captures during solve)
-    result.final_patch = get_git_diff(repo_path)
+    # 6. Let the agent modify the repository in the isolated workspace
+    agent_result = agent.solve(str(workspace_dir), task_description or instance.get("problem_statement", ""), test_command=test_cmd)
 
-    # 7. Run tests on the patched repo
-    test_cmd = instance.get("test_command", "pytest")
-    import subprocess
+    result.num_iterations = agent_result.num_iterations
+    result.total_tool_calls = agent_result.total_tool_calls
+
+    # 7. Capture the final patch produced by the agent
+    result.final_patch = agent_result.final_patch or get_git_diff(workspace_dir)
+
+    # 8. Run tests on the patched repo (independent confirmation of pass/fail)
     proc = subprocess.run(
-        ["/bin/sh", "-c", f"cd {repo_path} && {test_cmd}"],
+        [python_bin, "-m", "pytest", "--tb=short"],
+        cwd=str(workspace_dir),
         capture_output=True, text=True, timeout=60,
     )
     result.test_results = {
-        "command": test_cmd,
+        "command": f"{python_bin} -m pytest",
         "returncode": proc.returncode,
         "stdout": proc.stdout[:500],
         "stderr": proc.stderr[:500],
     }
 
-    # 8. Determine status based on evaluation criteria
-    result.status = _evaluate(result)
+    # 9. Determine status: official FAIL_TO_PASS/PASS_TO_PASS evaluation
+    if instance.get("FAIL_TO_PASS") or instance.get("PASS_TO_PASS"):
+        from swebench.utils import evaluate_fail_to_pass
+        f2p = evaluate_fail_to_pass(workspace_dir, instance, timeout=60, python_bin=python_bin)
+        result.status = f2p["status"]
+        result.fail_to_pass_count = f2p["fail_to_pass_count"]
+        result.fail_to_pass_total = f2p["fail_to_pass_total"]
+        result.pass_to_pass_count = f2p["pass_to_pass_count"]
+        result.pass_to_pass_total = f2p["pass_to_pass_total"]
+        result.fail_to_pass_results = f2p["fail_to_pass_results"]
+        result.pass_to_pass_results = f2p["pass_to_pass_results"]
+    else:
+        result.status = _evaluate(result)
 
     result.end_time = time.time()
     result.runtime = result.end_time - result.start_time
-    result.num_iterations = agent_config.get("max_iterations", 50)
-    result.total_tool_calls = agent_config.get("max_iterations", 50) * 3  # rough estimate
 
     return result
 
 
 def _evaluate(result: RunResult) -> str:
-    """Evaluate whether the instance was resolved.
-
-    Distinguishes between Resolved, Not Resolved, Test Failure, Patch Failure,
-    Timeout, Agent Error, and Environment Error.
+    """Fallback evaluation for instances with no FAIL_TO_PASS/PASS_TO_PASS
+    gold test lists -- just check whether the generic test_command run
+    passed.
     """
     if result.test_results.get("returncode") != 0:
         return "test_failure"
-    # Placeholder — real impl would diff against gold patch
     return "resolved"
 
 

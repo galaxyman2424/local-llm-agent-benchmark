@@ -217,12 +217,14 @@ class SWEBenchLite:
                 "test_command": "pytest",
             }
 
-        repo_path = self.seed_repo_dir / "repos" / instance_id.replace("__", "__")
         repo_name_for_path = instance_id.split("__")[0] if "__" in instance_id else instance_id
-        repo_path = Path(repo_path)
+        repo_path = self.seed_repo_dir / "repos" / instance_id
         if not repo_path.exists():
             # Create a minimal placeholder directory for the agent to work in
             repo_path.mkdir(parents=True, exist_ok=True)
+
+        from swebench.utils import ensure_repo_environment
+        python_bin = ensure_repo_environment(repo_path)
 
         record = {
             "instance_id": task_data.get("instance_id", instance_id),
@@ -235,27 +237,43 @@ class SWEBenchLite:
         start_time = __import__("time").time()
         record["start_time"] = start_time
 
-        task_text = task_data.get("task_description", "")
-        agent_result = agent.solve(str(repo_path), task_text)
+        task_text = task_data.get("task_description") or task_data.get("problem_statement", "")
+        test_cmd = task_data.get("test_command", "pytest")
+        agent_result = agent.solve(str(repo_path), task_text, test_command=test_cmd)
 
         end_time = __import__("time").time()
         record["end_time"] = end_time
         record["runtime_seconds"] = round(end_time - start_time, 1)
 
-        # Determine status based on agent result or test outcome
-        if hasattr(agent_result, "status"):
-            record["status"] = agent_result.status
+        # Determine status: official FAIL_TO_PASS/PASS_TO_PASS evaluation
+        # when the task actually provides those gold test lists, otherwise
+        # fall back to the agent's own quick self-assessment.
+        if task_data.get("FAIL_TO_PASS") or task_data.get("PASS_TO_PASS"):
+            from swebench.utils import evaluate_fail_to_pass
+            f2p = evaluate_fail_to_pass(repo_path, task_data, timeout=60, python_bin=python_bin)
+            record["status"] = f2p["status"]
+            record["fail_to_pass_count"] = f2p["fail_to_pass_count"]
+            record["fail_to_pass_total"] = f2p["fail_to_pass_total"]
+            record["pass_to_pass_count"] = f2p["pass_to_pass_count"]
+            record["pass_to_pass_total"] = f2p["pass_to_pass_total"]
+            record["fail_to_pass_results"] = f2p["fail_to_pass_results"]
+            record["pass_to_pass_results"] = f2p["pass_to_pass_results"]
+        elif hasattr(agent_result, "status"):
+            # No gold test lists (e.g. a synthetic local task) -- fall back
+            # to whatever the agent itself concluded. Map the agent's own
+            # "passed"/"failed" vocabulary onto this benchmark's
+            # "resolved"/"not_resolved" vocabulary for consistency.
+            record["status"] = {"passed": "resolved", "failed": "not_resolved"}.get(
+                agent_result.status, agent_result.status
+            )
         elif hasattr(agent_result, "success"):
-            record["status"] = "resolved" if agent_result.success else "failed"
+            record["status"] = "resolved" if agent_result.success else "not_resolved"
         else:
             record["status"] = "incomplete"
 
         record["num_iterations"] = getattr(agent_result, "num_iterations", 0) or 0
         record["total_tool_calls"] = getattr(agent_result, "total_tool_calls", 0) or 0
         record["final_patch"] = getattr(agent_result, "final_patch", "") or ""
-
-        if not hasattr(record, "status"):
-            record["status"] = "incomplete"
 
         return record
 
@@ -303,8 +321,8 @@ class SWEBenchLite:
                 result = self.run_instance(
                     agent=agent,
                     instance_id=instance_id,
-                    reasoner_model=getattr(task, None, {}).get("reasoner_model"),
-                    actioner_model=getattr(task, None, {}).get("actioner_model"),
+                    reasoner_model=task.get("reasoner_model"),
+                    actioner_model=task.get("actioner_model"),
                 )
                 results.append(result)
             except Exception as e:
@@ -348,8 +366,8 @@ class SWEBenchLite:
         failed_count = sum(1 for r in results if isinstance(r, dict) and r.get("status") != "resolved" and r.get("status") not in ("timeout",))
 
         total = len(results)
-        avg_runtime = (
-            round(sum(r.get("runtime_seconds", 0.0) or 0.0 for r in results if isinstance(r, dict)), 1) / max(total, 1),
+        avg_runtime = round(
+            sum(r.get("runtime_seconds", 0.0) or 0.0 for r in results if isinstance(r, dict)) / max(total, 1),
             2,
         )
 

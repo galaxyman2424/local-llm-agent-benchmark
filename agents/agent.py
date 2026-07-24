@@ -45,69 +45,90 @@ class Agent:
         self.actioner = actioner
         self.max_iterations = max_iterations
 
-    def solve(self, repo_path: str, task: str) -> AgentResult | None:
-        """Run the agent on a single SWE-bench-style task."""
+    def solve(self, repo_path: str, task: str, test_command: str = "pytest --tb=short") -> AgentResult:
+        """Run the agent on a single SWE-bench-style task.
+
+        Loop, per ACTIONPLAN.md section 4.4:
+            Reasoner analyzes task -> creates plan (next_action/parameters)
+            -> Actioner executes that action
+            -> if the action was a test run, check pass/fail
+            -> on failure, the outcome is fed back to the Reasoner as part of
+               previous_actions so it can propose a revised plan
+            -> repeat until tests pass, the reasoner has nothing left to do,
+               or max_iterations is reached.
+        """
         start_time = time.time()
 
+        # Point the actioner at this task's repo so file/command tools
+        # operate on the right workspace instead of the ambient cwd.
+        self.actioner.workspace_dir = repo_path
+
         iterations: list[IterationResult] = []
+        previous_actions: list[dict] = []
         total_tool_calls = 0
         final_patch = ""
-        test_passed = None
+        test_passed: bool | None = None
 
-        # Initial context from the repo state and task description
-        context = {
+        current_state: dict = {
             "repo_path": repo_path,
-            "task": task,
-            "base_commit": "",   # filled in when benchmark sets it up
-            "test_command": "pytest",
-            "current_state": "",
+            "test_command": test_command,
         }
 
         for i in range(self.max_iterations):
-            # 1. Reasoner produces a plan step based on current state
-            plan = self.reasoner.plan(context)
+            # 1. Reasoner produces the next action given task + state + history
+            plan = self.reasoner.plan(task, current_state, previous_actions)
             if not plan:
                 break
 
-            step = plan[0]
-            tool_call = step.action_type
-            target = step.target
+            tool_call = plan.get("next_action", "")
+            parameters = plan.get("parameters", {})
 
-            # 2. Actioner executes the step and records outcome
-            success = False
-            output = ""
+            if tool_call in ("submit_solution", "done", ""):
+                break
+
+            # 2. Actioner executes that action
+            action = {"tool": tool_call, "parameters": parameters}
             try:
-                if tool_call == "read":
-                    content = self.actioner.read_file(target)
-                    output = content or "(file not found)"
-                    success = True
-                elif tool_call == "write":
-                    # For write operations, we'd need the full patch/content
-                    # This is a simplified version; real impl would parse the plan
-                    result = self.actioner.execute_command(f"git apply {target}")
-                    output = result.stdout if result else ""
-                    success = True
-                elif tool_call == "execute":
-                    proc = self.actioner.execute_command(target)
-                    output = proc.stdout + proc.stderr
-                    success = proc.returncode == 0
-                else:
-                    # Generic fallback
-                    proc = self.actioner.execute_command(f"echo {target}")
-                    output = proc.stdout if proc else ""
-                    success = True
-
+                result = self.actioner.execute(action)
             except Exception as e:
-                output = str(e)
-                success = False
+                result = {"tool": tool_call, "error": str(e)}
 
-            iterations.append(IterationResult(i, tool_call, target, success, output))
+            success = "error" not in result
+            output = result.get("result", result.get("error", ""))
+            if isinstance(output, (dict, list)):
+                output = json.dumps(output)
+
+            iterations.append(IterationResult(i, tool_call, json.dumps(parameters), success, str(output)))
             total_tool_calls += 1
+            previous_actions.append({**action, "result": result})
 
-            # Update context with new state
-            context["current_state"] = json.dumps({tool_call: output}, indent=2)
+            # Track test outcomes as they happen so we know when to stop.
+            if tool_call == "run_tests":
+                test_passed = result.get("returncode") == 0
+                current_state["last_test_result"] = {
+                    "returncode": result.get("returncode"),
+                    "stdout": str(result.get("result", ""))[:2000],
+                    "stderr": str(result.get("stderr", ""))[:2000],
+                }
+                if test_passed:
+                    break
 
-        elapsed = time.time() - start_time
+            current_state["last_action"] = tool_call
+            current_state["last_output"] = str(output)[:2000]
+
+        # Capture whatever diff the agent produced, regardless of outcome.
+        try:
+            diff_result = self.actioner.execute({"tool": "get_git_diff", "parameters": {}})
+            final_patch = diff_result.get("result", "") or ""
+        except Exception:
+            final_patch = ""
+
+        if test_passed is None:
+            status = "incomplete"
+        elif test_passed:
+            status = "passed"
+        else:
+            status = "failed"
 
         result = AgentResult(
             instance_id="",       # filled by benchmark
@@ -117,8 +138,7 @@ class Agent:
             total_tool_calls=total_tool_calls,
             test_passed=test_passed,
             final_patch=final_patch,
-            status="incomplete" if test_passed is None else "passed" if test_passed else "failed",
+            status=status,
         )
 
-        # Store result for the benchmark to collect later
         return result

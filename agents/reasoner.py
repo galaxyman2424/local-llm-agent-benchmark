@@ -13,8 +13,9 @@ from typing import Any
 class Reasoner:
     """Reasoning component that analyzes tasks and produces action plans."""
 
-    def __init__(self, *, model_id: str = "qwen3.5:9b"):
+    def __init__(self, *, model_id: str = "qwen3.5:9b", timeout_seconds: float = 120.0):
         self.model_id = model_id
+        self.timeout_seconds = timeout_seconds
 
     def analyze(self, task_description: str, state_context: dict[str, Any]) -> dict[str, Any]:
         """Analyze the current repository state and generate a plan of actions."""
@@ -39,14 +40,12 @@ Provide your analysis as a structured JSON response with these fields:
             "expected_outcome": "Repository should be in correct state with all changes applied."
         }
 
-        # Simple heuristic parsing for now - in production, use the LLM response
         try:
-            import json
             result = self._call_model(prompt)
             if isinstance(result, dict):
                 analysis.update(result)
         except Exception as e:
-            pass  # Fall back to basic analysis
+            print(f"[Reasoner.analyze] Falling back to basic analysis: {e}")
 
         return analysis
 
@@ -88,11 +87,11 @@ Return a structured plan as JSON with:
             if isinstance(result, dict):
                 return {
                     "next_action": result.get("action", "read_file"),
-                    "parameters": result.get("params", {}),
-                    "expected_outcome": result.get("outcome", ""),
+                    "parameters": result.get("params", result.get("parameters", {})),
+                    "expected_outcome": result.get("outcome", result.get("expected_outcome", "")),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Reasoner.plan] Falling back to heuristic plan: {e}")
 
         # Fallback plan based on task description
         return {
@@ -102,11 +101,73 @@ Return a structured plan as JSON with:
         }
 
     def _call_model(self, prompt: str) -> Any:
-        """Call the reasoning model (Qwen 3.5)."""
-        try:
-            from agents.ollama_client import OllamaClient
-            client = OllamaClient(model=self.model_id)
-            return client.chat([{"role": "user", "content": prompt}])["message"]["content"]
-        except Exception as e:
-            print(f"[Reasoner] Error calling model: {e}")
+        """Call the reasoning model and parse its JSON reply into a dict.
+
+        Returns ``None`` (rather than raising) if the model is unreachable or
+        the reply isn't valid JSON, so callers can fall back to a heuristic.
+        """
+        import json as _json
+
+        from agents.ollama_client import OllamaClient
+
+        client = OllamaClient(model=self.model_id, timeout_seconds=self.timeout_seconds)
+        # json_mode grammar-constrains Ollama's decoding to valid JSON syntax
+        # -- without it, smaller local models frequently produce malformed
+        # JSON (unterminated strings, missing commas, stray prose before/
+        # after the object). num_predict is set generously so a full plan
+        # isn't silently truncated mid-string by a low default token cap.
+        response = client.chat(
+            [{"role": "user", "content": prompt}],
+            json_mode=True,
+            num_predict=1024,
+        )
+        text = response["message"]["content"]
+
+        candidate = _extract_json_object(text)
+        if candidate is None:
+            print("[Reasoner] Model reply contained no JSON object")
             return None
+        try:
+            return _json.loads(candidate)
+        except _json.JSONDecodeError as e:
+            print(f"[Reasoner] Model reply was not valid JSON: {e}")
+            return None
+
+
+def _extract_json_object(text: str) -> str | None:
+    """Extract the first balanced ``{...}`` object from free-form text.
+
+    Unlike a greedy ``\\{.*\\}`` regex (which spans from the first '{' to
+    the very LAST '}' anywhere in the text -- splicing unrelated content
+    together whenever a model emits more than one brace-looking chunk, e.g.
+    a JSON object followed by an explanation containing more braces), this
+    scans character-by-character and tracks brace depth (respecting quoted
+    strings, so braces inside string literals don't confuse the count) to
+    find exactly the first complete, balanced object.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None

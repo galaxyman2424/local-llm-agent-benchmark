@@ -25,6 +25,12 @@ class InstanceRecord:
     test_results: dict = field(default_factory=dict)
     final_patch: str = ""
     status: str = "incomplete"
+    fail_to_pass_count: int = 0
+    fail_to_pass_total: int = 0
+    pass_to_pass_count: int = 0
+    pass_to_pass_total: int = 0
+    fail_to_pass_results: dict = field(default_factory=dict)
+    pass_to_pass_results: dict = field(default_factory=dict)
 
 
 class SWEbenchBenchmark:
@@ -61,9 +67,30 @@ class SWEbenchBenchmark:
         return tasks
 
     def setup_repo(self, repo_name: str, base_commit: str) -> Path:
-        """Clone or checkout a seed repo at the specified commit."""
-        # For now we just record; real impl would clone + git checkout <commit>
-        repo_path = self.seed_repo_dir / "repos" / repo_name
+        """Clone (if needed) and checkout a seed repo at the specified commit."""
+        import subprocess
+
+        repos_dir = self.seed_repo_dir / "repos"
+        repos_dir.mkdir(parents=True, exist_ok=True)
+        # repo_name is typically "owner/repo"; use a flat dir name so nested
+        # slashes don't get misread as extra path segments.
+        repo_dir_name = repo_name.replace("/", "__")
+        repo_path = repos_dir / repo_dir_name
+
+        if not repo_path.exists():
+            clone_url = f"https://github.com/{repo_name}.git"
+            print(f"[SWEbenchBenchmark] Cloning {clone_url} -> {repo_path}")
+            subprocess.run(
+                ["git", "clone", clone_url, str(repo_path)],
+                capture_output=True, text=True, check=False,
+            )
+
+        if base_commit and repo_path.exists():
+            subprocess.run(
+                ["git", "checkout", "-f", base_commit],
+                cwd=str(repo_path), capture_output=True, text=True, check=False,
+            )
+
         return repo_path
 
     def run_instance(
@@ -87,33 +114,50 @@ class SWEbenchBenchmark:
 
         start = time.time()
 
-        # 1. Set up repo at base commit
+        # 1. Set up repo at base commit, and ensure it has its own
+        #    dependencies installed (a bare git checkout has none of them --
+        #    every test would otherwise fail immediately with import errors
+        #    regardless of what the agent did).
         record.start_time = start
         repo_path = self.setup_repo(repo_name, base_commit)
-        record.repo_name = str(repo_path.name)
+        from swebench.utils import ensure_repo_environment
+        python_bin = ensure_repo_environment(repo_path)
 
-        task_text = task.get("task_description", "")
-        agent_result = agent.solve(str(repo_path), task_text)
+        task_text = task.get("task_description") or task.get("problem_statement", "")
+        test_cmd = task.get("test_command", "pytest")
+        agent_result = agent.solve(str(repo_path), task_text, test_command=test_cmd)
 
         record.num_iterations = agent_result.num_iterations if agent_result else 0
         record.total_tool_calls = agent_result.total_tool_calls if agent_result else 0
         record.final_patch = agent_result.final_patch if agent_result else ""
 
-        # 2. Run tests on the patched repo
-        test_cmd = task.get("test_command", "pytest")
+        # 2. Run tests on the patched repo, using the repo's own venv
         proc = __import__("subprocess").run(
-            ["/bin/sh", "-c", f"cd {repo_path} && {test_cmd}"],
+            [python_bin, "-m", "pytest", "--tb=short"],
+            cwd=str(repo_path),
             capture_output=True, text=True, timeout=60,
         )
         record.test_results = {
-            "command": test_cmd,
+            "command": f"{python_bin} -m pytest",
             "returncode": proc.returncode,
             "stdout": proc.stdout[:500],
             "stderr": proc.stderr[:500],
         }
 
-        # 3. Compare against expected patch (for pass@1 evaluation)
-        record.status = self._evaluate(record)
+        # 3. Official evaluation: does the patch make FAIL_TO_PASS tests
+        #    pass while keeping PASS_TO_PASS tests passing?
+        if task.get("FAIL_TO_PASS") or task.get("PASS_TO_PASS"):
+            from swebench.utils import evaluate_fail_to_pass
+            f2p = evaluate_fail_to_pass(repo_path, task, timeout=60, python_bin=python_bin)
+            record.status = f2p["status"]
+            record.fail_to_pass_count = f2p["fail_to_pass_count"]
+            record.fail_to_pass_total = f2p["fail_to_pass_total"]
+            record.pass_to_pass_count = f2p["pass_to_pass_count"]
+            record.pass_to_pass_total = f2p["pass_to_pass_total"]
+            record.fail_to_pass_results = f2p["fail_to_pass_results"]
+            record.pass_to_pass_results = f2p["pass_to_pass_results"]
+        else:
+            record.status = self._evaluate(record)
 
         record.end_time = time.time()
         record.runtime = record.end_time - record.start_time
@@ -121,11 +165,13 @@ class SWEbenchBenchmark:
         return record
 
     def _evaluate(self, record: InstanceRecord) -> str:
-        """Simple evaluation: check if patch matches expected (placeholder)."""
-        # Real impl would diff the final patch against gold; here we just mark passed/failed
+        """Fallback evaluation for tasks with no FAIL_TO_PASS/PASS_TO_PASS
+        gold test lists (e.g. a synthetic or hand-authored local task) --
+        just check whether the generic test_command run passed.
+        """
         if record.test_results.get("returncode") == 0:
-            return "passed"
-        return "failed"
+            return "resolved"
+        return "not_resolved"
 
     def save_raw(self, results: list[InstanceRecord]) -> Path:
         """Persist raw results — never overwritten."""
@@ -139,14 +185,18 @@ class SWEbenchBenchmark:
     def save_processed(self, results: list[InstanceRecord]) -> Path:
         """Aggregate and save processed summary."""
         self.processed_results_dir.mkdir(parents=True, exist_ok=True)
-        passed = sum(1 for r in results if r.status == "passed")
         total = len(results)
+        resolved = sum(1 for r in results if r.status == "resolved")
+        by_status: dict[str, int] = {}
+        for r in results:
+            by_status[r.status] = by_status.get(r.status, 0) + 1
         path = self.processed_results_dir / "summary.json"
         with open(path, "w") as f:
             json.dump({
                 "total": total,
-                "passed": passed,
-                "pass_rate": passed / total if total else 0.0,
+                "resolved": resolved,
+                "resolve_rate": resolved / total if total else 0.0,
+                "by_status": by_status,
                 "results": [r.__dict__ for r in results],
             }, f, indent=2)
         return path

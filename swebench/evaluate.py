@@ -9,9 +9,13 @@ Environment Error. Tracks FAIL_TO_PASS and PASS_TO_PASS counts.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# See experiments/run_experiment.py for why this is needed.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 @dataclass
@@ -24,7 +28,11 @@ class EvalResult:
     final_patch: str = ""
     test_results: dict = field(default_factory=dict)
     fail_to_pass_count: int = 0
+    fail_to_pass_total: int = 0
     pass_to_pass_count: int = 0
+    pass_to_pass_total: int = 0
+    fail_to_pass_results: dict = field(default_factory=dict)
+    pass_to_pass_results: dict = field(default_factory=dict)
     evaluation_time: float = 0.0
 
 
@@ -50,17 +58,25 @@ def evaluate_instance(
     EvalResult
         The structured evaluation result.
     """
-    from swebench.utils import load_instance, get_git_diff
+    from swebench.utils import load_instance, get_git_diff, evaluate_fail_to_pass
 
-    # Load instance metadata if we don't have a repo path yet
-    if repo_path is None:
+    # Load instance metadata whenever we can, since we need it for the
+    # test_command regardless of whether repo_path was already supplied.
+    instance: dict = {}
+    try:
         instance = load_instance(instance_id, dataset_path)
+    except (FileNotFoundError, KeyError) as e:
+        print(f"[evaluate] Could not load instance metadata: {e}")
+
+    if repo_path is None:
         repo_name = instance.get("repo", "unknown")
         base_commit = instance.get("base_commit", "")
         repo_path = Path(f"seed_repos/{repo_name}")
     else:
-        repo_name = str(repo_path.parent.name) if repo_path.exists() else "unknown"
-        base_commit = ""
+        repo_name = instance.get("repo") or (
+            str(repo_path.parent.name) if repo_path.exists() else "unknown"
+        )
+        base_commit = instance.get("base_commit", "")
 
     # Capture the final patch (agent's last git diff)
     start_time = time.time()
@@ -76,30 +92,53 @@ def evaluate_instance(
         final_patch=final_patch,
     )
 
-    # Run tests to determine resolution status
-    test_cmd = instance.get("test_command", "pytest") if dataset_path else "pytest"
-    import subprocess
-    proc = subprocess.run(
-        ["/bin/sh", "-c", f"cd {repo_path} && {test_cmd}"],
-        capture_output=True, text=True, timeout=60,
-    )
-
-    result.test_results = {
-        "command": test_cmd,
-        "returncode": proc.returncode,
-        "stdout": proc.stdout[:500],
-        "stderr": proc.stderr[:500],
-    }
-
-    # Determine status based on evaluation criteria
     if "Agent Error" in final_patch:
         result.status = "agent_error"
-    elif proc.returncode != 0:
-        result.status = "test_failure"
+        result.evaluation_time = time.time() - start_time
+        return result
+
+    if not Path(repo_path).exists():
+        result.status = "environment_error"
+        result.evaluation_time = time.time() - start_time
+        return result
+
+    # Quick sanity-check test_command run, kept for debugging visibility.
+    # This is NOT the authoritative pass/fail signal -- see below.
+    test_cmd = instance.get("test_command", "pytest")
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["/bin/sh", "-c", f"cd {repo_path} && {test_cmd}"],
+            capture_output=True, text=True, timeout=60,
+        )
+        result.test_results = {
+            "command": test_cmd,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout[:500],
+            "stderr": proc.stderr[:500],
+        }
+    except subprocess.TimeoutExpired:
+        result.test_results = {"command": test_cmd, "returncode": None, "error": "timeout"}
+
+    # Authoritative status: does the patch make FAIL_TO_PASS tests pass
+    # while keeping PASS_TO_PASS tests passing (the official SWE-bench
+    # resolution criterion), when the dataset actually provides those
+    # lists for this instance.
+    if instance.get("FAIL_TO_PASS") or instance.get("PASS_TO_PASS"):
+        f2p = evaluate_fail_to_pass(repo_path, instance, timeout=60)
+        result.status = f2p["status"]
+        result.fail_to_pass_count = f2p["fail_to_pass_count"]
+        result.fail_to_pass_total = f2p["fail_to_pass_total"]
+        result.pass_to_pass_count = f2p["pass_to_pass_count"]
+        result.pass_to_pass_total = f2p["pass_to_pass_total"]
+        result.fail_to_pass_results = f2p["fail_to_pass_results"]
+        result.pass_to_pass_results = f2p["pass_to_pass_results"]
     else:
-        # In a full implementation, we'd diff the patch against gold
-        # For now, assume resolved if tests pass
-        result.status = "resolved"
+        # No gold test lists available for this instance (e.g. a synthetic
+        # or hand-authored local task) -- fall back to the simple
+        # return-code check from the sanity-check run above.
+        returncode = result.test_results.get("returncode")
+        result.status = "resolved" if returncode == 0 else "test_failure"
 
     result.evaluation_time = time.time() - start_time
     return result
@@ -108,7 +147,7 @@ def evaluate_instance(
 def evaluate_batch(
     instances: list[dict],
     repo_paths: dict[str, Path] | None = None,
-) -> list[EvalResult]:
+) -> dict:
     """Evaluate multiple SWE-bench instances.
 
     Parameters
@@ -120,8 +159,8 @@ def evaluate_batch(
 
     Returns
     -------
-    list[EvalResult]
-        Evaluation results for each instance.
+    dict
+        ``{"results": [EvalResult, ...], "summary": {...}}``
     """
     results = []
     for inst in instances:
@@ -133,9 +172,13 @@ def evaluate_batch(
         )
         results.append(result)
 
-    # Compute aggregate stats
-    resolved = sum(1 for r in results if r.status == "resolved")
-    failed = sum(1 for r in results if r.status == "test_failure" or r.status == "agent_error")
+    # Compute aggregate stats, broken down by every status the evaluator
+    # can actually produce (not just resolved/failed).
+    by_status: dict[str, int] = {}
+    for r in results:
+        by_status[r.status] = by_status.get(r.status, 0) + 1
+
+    resolved = by_status.get("resolved", 0)
     fail_to_pass = sum(r.fail_to_pass_count for r in results)
     pass_to_pass = sum(r.pass_to_pass_count for r in results)
 
@@ -144,7 +187,7 @@ def evaluate_batch(
         "summary": {
             "total": len(results),
             "resolved": resolved,
-            "failed": failed,
+            "by_status": by_status,
             "fail_to_pass_count": fail_to_pass,
             "pass_to_pass_count": pass_to_pass,
         },

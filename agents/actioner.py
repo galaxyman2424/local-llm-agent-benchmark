@@ -11,51 +11,57 @@ class Actioner:
     including file operations, code search, command execution, and test running.
     """
 
-    def __init__(self):
+    def __init__(self, model_id: str = "ornith:9b", workspace_dir: str | None = None):
+        # model_id is accepted for interface symmetry with Reasoner and so
+        # config-driven callers (e.g. experiments/run_experiment.py) can pass
+        # an actioner model name; the Actioner itself doesn't call an LLM
+        # directly today; it just executes concrete tool calls handed to it.
+        self.model_id = model_id
+        self.workspace_dir = workspace_dir or "."
         self._history = []
+
+    def _resolve_path(self, path: str) -> str:
+        """Resolve a file path against the current workspace.
+
+        Supports an explicit '@workspace:relative/path' prefix, and also
+        treats any plain relative path as relative to workspace_dir (rather
+        than the process's ambient cwd) since that's what callers actually
+        produce in practice. Absolute paths pass through unchanged.
+        """
+        import os
+
+        if path.startswith("@"):
+            parts = path.split(":", 1)
+            if len(parts) == 2 and parts[0] == "@workspace":
+                return os.path.join(self.workspace_dir, parts[1])
+            return path
+
+        if os.path.isabs(path):
+            return path
+
+        return os.path.join(self.workspace_dir, path)
 
     def execute(self, action: dict[str, Any]) -> dict[str, Any]:
         """Execute a single tool call and return the result."""
         tool_name = action.get("tool", "unknown")
         params = action.get("parameters", {})
+        self._history.append(action)
 
         try:
             if tool_name == "read_file":
-                path = params.get("path", "")
-                # Convert @workspace: prefix to local path
-                if path.startswith("@"):
-                    workspace_dir = "/home/connor/projects"
-                    import os
-                    parts = path.split(":")
-                    if len(parts) == 2 and parts[0] == "workspace":
-                        path = os.path.join(workspace_dir, parts[1])
-
+                path = self._resolve_path(params.get("path", ""))
                 with open(path, 'r') as f:
                     content = f.read()
                 return {"tool": tool_name, "result": content}
 
             elif tool_name == "write_to_file":
-                path = params.get("path", "")
-                if path.startswith("@"):
-                    workspace_dir = "/home/connor/projects"
-                    import os
-                    parts = path.split(":")
-                    if len(parts) == 2 and parts[0] == "workspace":
-                        path = os.path.join(workspace_dir, parts[1])
-
+                path = self._resolve_path(params.get("path", ""))
                 with open(path, 'w') as f:
                     f.write(params.get("content", ""))
                 return {"tool": tool_name, "result": f"File written to {path}"}
 
-            elif tool_name == "replace_in_file":
-                path = params.get("path", "")
-                if path.startswith("@"):
-                    workspace_dir = "/home/connor/projects"
-                    import os
-                    parts = path.split(":")
-                    if len(parts) == 2 and parts[0] == "workspace":
-                        path = os.path.join(workspace_dir, parts[1])
-
+            elif tool_name in ("replace_in_file", "edit_file"):
+                path = self._resolve_path(params.get("path", ""))
                 with open(path, 'r') as f:
                     content = f.read()
 
@@ -71,7 +77,7 @@ class Actioner:
                     return {"tool": tool_name, "error": f"SEARCH/REPLACE failed. Text not found in {path}"}
 
             elif tool_name == "delete_file":
-                path = params.get("path", "")
+                path = self._resolve_path(params.get("path", ""))
                 import os
                 if os.path.exists(path):
                     os.remove(path)
@@ -80,7 +86,7 @@ class Actioner:
                     return {"tool": tool_name, "error": f"File not found: {path}"}
 
             elif tool_name == "list_directory":
-                path = params.get("path", ".")
+                path = self._resolve_path(params.get("path", "."))
                 import os
                 items = []
                 for item in os.listdir(path):
@@ -92,7 +98,7 @@ class Actioner:
                 return {"tool": tool_name, "result": items}
 
             elif tool_name == "search_code":
-                path = params.get("path", ".")
+                path = self._resolve_path(params.get("path", self.workspace_dir))
                 query = params.get("query", "")
                 import subprocess
                 result = subprocess.run(
@@ -106,7 +112,8 @@ class Actioner:
                 command = params.get("command", "")
                 import subprocess
                 result = subprocess.run(
-                    command, shell=True, capture_output=True, text=True
+                    command, shell=True, capture_output=True, text=True,
+                    cwd=self.workspace_dir,
                 )
                 return {
                     "tool": tool_name,
@@ -116,10 +123,11 @@ class Actioner:
                 }
 
             elif tool_name == "run_tests":
-                path = params.get("path", ".")
+                test_command = params.get("command", "pytest --tb=short")
                 import subprocess
                 result = subprocess.run(
-                    ["pytest", "--tb=short"], capture_output=True, text=True
+                    test_command, shell=True, capture_output=True, text=True,
+                    cwd=self.workspace_dir,
                 )
                 return {
                     "tool": tool_name,
@@ -129,19 +137,13 @@ class Actioner:
                 }
 
             elif tool_name == "get_git_diff":
-                diff = params.get("diff", "")
-                if not diff:
-                    import subprocess
-                    result = subprocess.run(
-                        ["git", "diff"], capture_output=True, text=True
-                    )
-                    return {"tool": tool_name, "result": result.stdout}
-                else:
-                    import subprocess
-                    result = subprocess.run(
-                        f"git diff {diff}", shell=True, capture_output=True, text=True
-                    )
-                    return {"tool": tool_name, "result": result.stdout}
+                diff_ref = params.get("diff", "")
+                import subprocess
+                cmd = ["git", "diff"] if not diff_ref else ["git", "diff", diff_ref]
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, cwd=self.workspace_dir,
+                )
+                return {"tool": tool_name, "result": result.stdout}
 
             elif tool_name == "submit_solution":
                 instance_id = params.get("instance_id", "")

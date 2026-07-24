@@ -17,6 +17,8 @@ from pathlib import Path
 def download_dataset(
     cache_dir: str | None = None,
     dataset_url: str | None = None,
+    hf_dataset_id: str = "princeton-nlp/SWE-bench_Lite",
+    hf_split: str = "test",
 ) -> Path:
     """Download the SWE-bench Lite dataset and save it locally.
 
@@ -27,9 +29,15 @@ def download_dataset(
         subdirectory under ``seed_repos/swe_bench_lite/`` in the current
         project root.
     dataset_url :
-        URL to fetch the dataset from. If not provided, defaults to the
-        official SWE-bench Lite JSONL endpoint or raises an error if no
-        source is configured.
+        Direct URL to a JSONL file. If provided, this takes priority over
+        the Hugging Face path (useful for mirrors or pre-converted files).
+    hf_dataset_id :
+        Hugging Face dataset id to fall back to when no ``dataset_url`` is
+        given. Defaults to the official SWE-bench Lite dataset. See
+        ``docs/DOWNLOADING_SWEBENCH_LITE.md`` for details and alternatives.
+    hf_split :
+        Dataset split to load from Hugging Face (SWE-bench Lite only has
+        a "test" split).
 
     Returns
     -------
@@ -56,25 +64,41 @@ def download_dataset(
         print(f"[download_dataset] Dataset already cached at {dataset_path}")
         return dataset_path
 
-    # In a real implementation we'd fetch from the network. For now we raise
-    # since this is a scaffolding script — replace with actual download logic
-    # when integrating with the SWE-bench API or GitHub releases.
-    if not dataset_url:
-        raise RuntimeError(
-            "No dataset URL provided and local file not found. "
-            "Provide dataset_url or pre-populate the cache."
+    if dataset_url:
+        print(f"[download_dataset] Fetching dataset from {dataset_url}")
+        import subprocess
+        result = subprocess.run(
+            ["curl", "-sL", dataset_url, "--output", str(dataset_path)],
+            capture_output=True, text=True, check=False,
         )
+        if result.returncode != 0:
+            raise RuntimeError(f"Failed to download dataset: {result.stderr}")
+        print(f"[download_dataset] Saved to {dataset_path}")
+        return dataset_path
 
-    print(f"[download_dataset] Fetching dataset from {dataset_url}")
-    import subprocess
-    result = subprocess.run(
-        ["curl", "-sL", dataset_url, "--output", str(dataset_path)],
-        capture_output=True, text=True, check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to download dataset: {result.stderr}")
+    # Default path: pull the official dataset from Hugging Face. Requires
+    # `pip install datasets`. See docs/DOWNLOADING_SWEBENCH_LITE.md for
+    # alternative methods (huggingface_hub parquet download, official
+    # swebench harness) if this dependency isn't available.
+    print(f"[download_dataset] No --url given; fetching '{hf_dataset_id}' "
+          f"(split={hf_split}) from Hugging Face")
+    try:
+        from datasets import load_dataset as hf_load_dataset
+    except ImportError as e:
+        raise RuntimeError(
+            "No dataset_url provided and the 'datasets' package isn't "
+            "installed. Install it with `pip install datasets "
+            "--break-system-packages`, or see "
+            "docs/DOWNLOADING_SWEBENCH_LITE.md for alternative download "
+            "methods."
+        ) from e
 
-    print(f"[download_dataset] Saved to {dataset_path}")
+    ds = hf_load_dataset(hf_dataset_id, split=hf_split)
+    with open(dataset_path, "w") as f:
+        for row in ds:
+            f.write(json.dumps(row) + "\n")
+
+    print(f"[download_dataset] Wrote {len(ds)} instances to {dataset_path}")
     return dataset_path
 
 
