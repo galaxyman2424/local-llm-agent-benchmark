@@ -121,7 +121,7 @@ class SWEbenchBenchmark:
         record.start_time = start
         repo_path = self.setup_repo(repo_name, base_commit)
         from swebench.utils import ensure_repo_environment
-        python_bin = ensure_repo_environment(repo_path)
+        python_bin, install_ok = ensure_repo_environment(repo_path)
 
         task_text = task.get("task_description") or task.get("problem_statement", "")
         test_cmd = task.get("test_command", "pytest")
@@ -130,6 +130,17 @@ class SWEbenchBenchmark:
         record.num_iterations = agent_result.num_iterations if agent_result else 0
         record.total_tool_calls = agent_result.total_tool_calls if agent_result else 0
         record.final_patch = agent_result.final_patch if agent_result else ""
+
+        if not install_ok:
+            # Environment setup genuinely failed -- running tests would
+            # just fail for everything regardless of the agent, wasting a
+            # lot of time across many instances. Mark it distinctly rather
+            # than letting it masquerade as "the agent didn't fix the bug".
+            record.status = "environment_error"
+            record.test_results = {"error": "repo dependency installation failed; see .swebench_venv/pip_install.log"}
+            record.end_time = time.time()
+            record.runtime = record.end_time - record.start_time
+            return record
 
         # 2. Run tests on the patched repo, using the repo's own venv
         proc = __import__("subprocess").run(

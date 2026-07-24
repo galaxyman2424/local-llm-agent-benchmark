@@ -18,7 +18,7 @@ class OllamaClient:
         model: str = "qwen2.5-coder:3b-instruct",
         *,
         base_url: str | None = None,
-        timeout_seconds: float = 60.0,
+        timeout_seconds: float = 300.0,
     ):
         self.model = model
         self.base_url = base_url or self.BASE_URL
@@ -60,6 +60,8 @@ class OllamaClient:
         temperature: float = 0.7,
         json_mode: bool = False,
         num_predict: int | None = None,
+        keep_alive: str | int | None = None,
+        think: bool | None = None,
     ):
         """Send a chat completion request.
 
@@ -95,7 +97,10 @@ class OllamaClient:
             Parsed JSON body from the API (non-streaming), or a generator of
             chunks (streaming).
         """
-        options: dict[str, Any] = {"temperature": temperature}
+        options: dict[str, Any] = {
+            "temperature": temperature,
+        }
+
         if num_predict is not None:
             options["num_predict"] = num_predict
 
@@ -105,20 +110,22 @@ class OllamaClient:
             "stream": stream,
             "options": options,
         }
+
         if json_mode:
             payload["format"] = "json"
 
-        if stream:
-            # Returning the generator itself (rather than yielding here)
-            # keeps `chat` a normal function: calling chat(stream=False)
-            # executes immediately instead of silently becoming a generator
-            # function that never runs until iterated.
-            return self._chat_stream(payload)
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
 
-        result = self._request("POST", "/api/chat", payload)
-        if "error" in result:
-            raise RuntimeError(result["error"])
-        return result
+        if not stream:
+            result = self._request("POST", "/api/chat", payload)
+
+            if "error" in result:
+                raise RuntimeError(result["error"])
+
+            return result
+
+        return self._chat_stream(payload)
 
     def _chat_stream(self, payload: dict[str, Any]) -> Generator[dict[str, Any], None, None]:
         """Yield successive JSON chunks from a streaming /api/chat response."""

@@ -224,7 +224,7 @@ class SWEBenchLite:
             repo_path.mkdir(parents=True, exist_ok=True)
 
         from swebench.utils import ensure_repo_environment
-        python_bin = ensure_repo_environment(repo_path)
+        python_bin, install_ok = ensure_repo_environment(repo_path)
 
         record = {
             "instance_id": task_data.get("instance_id", instance_id),
@@ -244,6 +244,13 @@ class SWEBenchLite:
         end_time = __import__("time").time()
         record["end_time"] = end_time
         record["runtime_seconds"] = round(end_time - start_time, 1)
+
+        if not install_ok:
+            # Environment setup genuinely failed -- see
+            # .swebench_venv/pip_install.log. Don't let this masquerade as
+            # "the agent didn't fix the bug".
+            record["status"] = "environment_error"
+            return record
 
         # Determine status: official FAIL_TO_PASS/PASS_TO_PASS evaluation
         # when the task actually provides those gold test lists, otherwise

@@ -270,11 +270,89 @@ def run_command(cmd: str | list[str], timeout: float = 60.0) -> subprocess.Compl
 # parity, use the official Docker-based harness (see
 # docs/DOWNLOADING_SWEBENCH_LITE.md, Option 3).
 
+def _read_pyproject_build_requires(path: str | Path) -> list[str]:
+    """Read a package's own declared build requirements from its
+    ``pyproject.toml`` ``[build-system] requires`` list.
+
+    This is far more reliable than guessing a generic set of build
+    prerequisites -- e.g. astropy's pyproject.toml declares
+    ``extension-helpers``, a specific pinned ``cython`` version, and
+    ``oldest-supported-numpy``, none of which a generic
+    numpy/Cython/setuptools/wheel guess would include.
+
+    Returns an empty list if there's no pyproject.toml, no
+    ``[build-system]`` section, or it can't be parsed.
+    """
+    pyproject = Path(path) / "pyproject.toml"
+    if not pyproject.exists():
+        return []
+
+    text = pyproject.read_text()
+    try:
+        try:
+            import tomllib  # Python 3.11+
+        except ImportError:
+            import tomli as tomllib  # type: ignore[no-redef]
+        data = tomllib.loads(text)
+        return list(data.get("build-system", {}).get("requires", []))
+    except Exception:
+        pass
+
+    # Fallback: no TOML parser available -- regex out a simple single
+    # `requires = [...]` block, which covers the common case.
+    import re
+    match = re.search(r"requires\s*=\s*\[(.*?)\]", text, re.DOTALL)
+    if not match:
+        return []
+    return re.findall(r'["\']([^"\']+)["\']', match.group(1))
+
+
+def _find_build_python() -> str:
+    """Find the best available Python interpreter for building old packages.
+
+    Many SWE-bench-era packages (astropy and similar C-extension packages
+    circa 2020-2023) cannot build on Python 3.12+ at all, regardless of
+    setuptools pinning: ``distutils`` was removed from the stdlib in 3.12,
+    and setuptools versions old enough to still support the deprecated
+    APIs those packages call (e.g. ``setuptools.dep_util``) predate
+    setuptools's own Python-3.12 compatibility work (they hit
+    ``pkgutil.ImpImporter``, also removed in 3.12) -- there is no
+    overlapping version that satisfies both constraints.
+
+    If the interpreter currently running this code is already 3.11 or
+    older, just use it. Otherwise search for an older interpreter on PATH
+    (newest-first: 3.11, 3.10, 3.9, 3.8) and use that instead if found.
+    Falls back to ``sys.executable`` with a loud warning if nothing older
+    is available -- the resulting venv will likely fail to build older
+    C-extension packages, but is still useful for pure-Python repos.
+    """
+    if sys.version_info[:2] <= (3, 11):
+        return sys.executable
+
+    for minor in (11, 10, 9, 8):
+        candidate = shutil.which(f"python3.{minor}")
+        if candidate:
+            return candidate
+
+    print(
+        "[env] WARNING: only Python "
+        f"{sys.version_info[0]}.{sys.version_info[1]} is available, and no "
+        "older interpreter (python3.11/3.10/3.9/3.8) was found on PATH. "
+        "Older C-extension packages (astropy, and similar packages from "
+        "~2020-2023) are known to fail building on Python 3.12+ regardless "
+        "of setuptools pinning -- distutils was removed from the stdlib "
+        "in 3.12. Install an older Python for full compatibility, e.g.:\n"
+        "    sudo apt install python3.10 python3.10-venv\n"
+        "and re-run -- this function will pick it up automatically."
+    )
+    return sys.executable
+
+
 def ensure_repo_environment(
     repo_path: str | Path,
     install_path: str | Path | None = None,
-    timeout: float = 600.0,
-) -> str:
+    timeout: float = 900.0,
+) -> tuple[str, bool]:
     """Create (or reuse) a per-repo virtualenv with the package installed
     editable, plus pytest and commonly-missing test dependencies.
 
@@ -290,68 +368,230 @@ def ensure_repo_environment(
         ``repo_path``. Pass a per-instance workspace directory here (e.g.
         a git worktree with the agent's edits) so the venv's editable
         install points at THAT instance's files rather than a stale copy
-        in the shared repo -- re-running ``pip install -e <install_path>``
-        against an already-populated venv is fast (it only needs to update
-        the editable pointer, not reinstall every dependency).
+        in the shared repo -- re-running the install against an
+        already-populated venv is fast (it only needs to update the
+        editable pointer, not reinstall every dependency).
     timeout :
-        Per-pip-install-step timeout in seconds (dependency installs for
-        large scientific packages like astropy/scikit-learn can be slow).
+        Per-pip-install-step timeout in seconds. Building packages with C
+        extensions (astropy, scikit-learn, ...) from scratch can genuinely
+        take several minutes; raised from 600s to 900s.
 
     Returns
     -------
-    str
-        Path to that venv's ``python`` executable. Callers should use this
-        (via ``[python_bin, "-m", "pytest", ...]``) instead of the ambient
-        ``python``/``pytest`` when running tests for this repo.
+    tuple[str, bool]
+        ``(python_bin, install_ok)`` -- the venv's python executable, and
+        whether the package itself installed successfully. Callers should
+        check ``install_ok`` and record it distinctly from "agent didn't
+        fix the bug" -- a failed environment setup means the FAIL_TO_PASS/
+        PASS_TO_PASS check was never meaningful for this instance,
+        regardless of what the agent did.
+
+    Full pip output for every step is written to
+    ``<repo_path>/.swebench_venv/pip_install.log`` (appended across calls)
+    so failures are actually diagnosable -- only a short summary is
+    printed to the console.
     """
     repo_path = Path(repo_path)
     install_path = Path(install_path) if install_path else repo_path
     venv_dir = repo_path / ".swebench_venv"
     venv_python = venv_dir / "bin" / "python"
+    log_path = venv_dir / "pip_install.log"
 
+    build_python = _find_build_python()
     venv_already_existed = venv_python.exists()
 
+    if venv_already_existed:
+        # Detect staleness: if a different (e.g. now-installed older)
+        # Python is preferred than whatever this venv was actually built
+        # with, rebuild rather than silently reusing it forever -- a stale
+        # venv skips every install step below (gated on "not
+        # venv_already_existed"), so it would otherwise never pick up
+        # dependency/pytest-version/setuptools-pin fixes made after it was
+        # first created.
+        def _venv_py_version(python_exe: str) -> str:
+            try:
+                proc = subprocess.run(
+                    [python_exe, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                return proc.stdout.strip() or "?"
+            except Exception:
+                return "?"
+
+        existing_version = _venv_py_version(str(venv_python))
+        target_version = _venv_py_version(build_python)
+
+        if target_version != "?" and existing_version != target_version:
+            print(f"[env] Existing venv for {repo_path.name} was built with Python "
+                  f"{existing_version}, but Python {target_version} is now preferred "
+                  f"(e.g. an older interpreter was installed after this venv was "
+                  f"first created) -- rebuilding from scratch so all fixes apply.")
+            shutil.rmtree(venv_dir, ignore_errors=True)
+            venv_already_existed = False
+        else:
+            print(f"[env] Reusing existing venv for {repo_path.name} (Python {existing_version})")
+
     if not venv_already_existed:
-        print(f"[env] Creating virtualenv for {repo_path.name} at {venv_dir}")
+        print(f"[env] Creating virtualenv for {repo_path.name} at {venv_dir} (using {build_python})")
+        venv_dir.parent.mkdir(parents=True, exist_ok=True)
         result = subprocess.run(
-            [sys.executable, "-m", "venv", str(venv_dir)],
+            [build_python, "-m", "venv", str(venv_dir)],
             capture_output=True, text=True, check=False,
         )
         if result.returncode != 0 or not venv_python.exists():
             print(f"[env] Warning: failed to create venv for {repo_path.name} "
                   f"({result.stderr.strip()[:200]}); falling back to ambient Python")
-            return sys.executable
+            return sys.executable, False
 
-    def _pip(*args: str, cwd: Path) -> None:
+    def _log(heading: str, proc: subprocess.CompletedProcess) -> None:
+        with open(log_path, "a") as f:
+            f.write(f"\n{'='*70}\n{heading}\nreturncode={proc.returncode}\n")
+            f.write(f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}\n")
+
+    last_failure_output = ""
+
+    def _pip(*args: str, cwd: Path, extra_env: dict | None = None) -> bool:
+        """Run a pip command; returns True on success (returncode 0)."""
+        nonlocal last_failure_output
+        env = {**os.environ, **(extra_env or {})}
         try:
             proc = subprocess.run(
-                [str(venv_python), "-m", "pip", *args, "-q"],
+                [str(venv_python), "-m", "pip", *args],
                 cwd=str(cwd), capture_output=True, text=True,
-                timeout=timeout, check=False,
+                timeout=timeout, check=False, env=env,
             )
+            _log(f"pip {' '.join(args)} (cwd={cwd})", proc)
             if proc.returncode != 0:
-                print(f"[env] pip {' '.join(args)} for {cwd.name} "
-                      f"exited {proc.returncode}: {proc.stderr.strip()[:300]}")
+                last_failure_output = proc.stderr + proc.stdout
+                # Print a genuinely useful chunk, not 300 chars -- and
+                # always point at the full log for the rest.
+                tail = proc.stderr.strip()[-1500:] or proc.stdout.strip()[-1500:]
+                print(f"[env] pip {' '.join(args)} for {cwd.name} exited "
+                      f"{proc.returncode}. Last part of output:\n{tail}\n"
+                      f"[env] Full output logged to {log_path}")
+                return False
+            return True
         except subprocess.TimeoutExpired:
             print(f"[env] pip {' '.join(args)} for {cwd.name} timed out after {timeout}s")
+            return False
 
     if not venv_already_existed:
-        _pip("install", "--upgrade", "pip", cwd=repo_path)
+        _pip("install", "--upgrade", "pip", "-q", cwd=repo_path)
+
+        build_requires = _read_pyproject_build_requires(install_path)
+        if build_requires:
+            print(f"[env] Installing {install_path.name}'s declared build requirements: {build_requires}")
+            _pip("install", "-q", *build_requires, cwd=repo_path)
+        else:
+            # No pyproject.toml (or no [build-system] requires) to go on --
+            # fall back to a generic guess for packages with C extensions.
+            _pip("install", "-q", "numpy", "Cython", "setuptools", "wheel", cwd=repo_path)
+
+        # Pin AFTER the declared requirements so this wins: pyproject.toml
+        # build-system.requires commonly just says "setuptools" with no
+        # upper bound, which resolves to the latest version -- but many
+        # SWE-bench-era packages call setup.py APIs (e.g.
+        # setuptools.dep_util) that were removed in modern setuptools.
+        # This is the actual cause of a second, different build failure
+        # seen in practice after fixing the first (missing declared build
+        # deps) one.
+        #
+        # IMPORTANT: pin to an EXACT version, not just an upper bound like
+        # "<71" -- setuptools 70.3.0 (which satisfies "<71") already lacks
+        # dep_util entirely, so that bound doesn't actually get you a
+        # working version. 65.5.0 is confirmed (via direct testing) to
+        # still contain the dep_util module, and satisfies
+        # extension-helpers' own "setuptools>=64" requirement. On Python
+        # 3.12+ this version still fails for an unrelated reason
+        # (dep_util's own top-level code references pkgutil.ImpImporter,
+        # removed in 3.12) -- but on Python 3.10/3.11 (what
+        # _find_build_python should have selected), it works cleanly.
+        _pip("install", "-q", "setuptools==65.5.0", "wheel", cwd=repo_path)
+
         # A reasonably old, broadly-compatible pytest -- SWE-bench Lite
         # repos mostly predate pytest 8's stricter warning-filter parsing,
         # which is exactly the crash seen in practice against newer
         # pytest. Also install `hypothesis`, a very common SWE-bench test
         # dependency (astropy, sympy, etc.) not always pulled in by a
-        # plain `pip install -e .`.
-        _pip("install", "pytest<8", "hypothesis", cwd=repo_path)
+        # plain package install.
+        # `hypothesis` and `pytest-remotedata` are both very common
+        # SWE-bench-era test dependencies (astropy, sympy, and others) not
+        # always pulled in by a plain package install. pytest-remotedata
+        # specifically gates tests marked @pytest.mark.remote_data (tests
+        # that would otherwise need network access) -- without it,
+        # collecting any test file that imports it directly raises
+        # ModuleNotFoundError and aborts collection of the whole run.
+        _pip("install", "-q", "pytest<8", "hypothesis", "pytest-remotedata", cwd=repo_path)
 
-    # Always (re-)do the editable install against install_path, even on a
-    # reused venv -- this is what makes a per-instance workspace's edits
-    # actually importable, and is cheap once dependencies are already in
-    # place.
-    _pip("install", "-e", ".", cwd=install_path)
+    # Fetch git submodules -- older astropy (and other packages of that
+    # era) vendored C libraries (cfitsio, wcslib, expat, erfa) as git
+    # submodules, which a plain `git clone` never populates. Best-effort:
+    # harmless no-op for repos without submodules.
+    subprocess.run(
+        ["git", "submodule", "update", "--init", "--recursive"],
+        cwd=str(install_path), capture_output=True, text=True,
+        timeout=timeout, check=False,
+    )
 
-    return str(venv_python)
+    # Install the package itself editable, from install_path, using
+    # --no-build-isolation so it actually respects everything we just
+    # installed (numpy/Cython/the declared build requirements/our
+    # setuptools pin). We deliberately do NOT fall back to a normal
+    # isolated build on failure: an isolated build creates its own fresh
+    # temporary environment from pyproject.toml's own declared
+    # requirements (usually an unbounded "setuptools"), which reintroduces
+    # exactly the dep_util-style failure we just fixed -- so a retry there
+    # can never help for the packages this pin exists for, and just
+    # produces a second, confusingly-different-looking failure.
+    install_ok = _pip("install", "-q", "--no-build-isolation", "-e", ".", cwd=install_path)
+
+    if not install_ok:
+        hint = _diagnose_build_failure(last_failure_output, venv_python)
+        print(f"[env] WARNING: could not install {install_path.name}'s own package. "
+              f"Tests will very likely fail regardless of what the agent did -- "
+              f"see {log_path} for the full error.")
+        if hint:
+            print(f"[env] {hint}")
+
+    return str(venv_python), install_ok
+
+
+def _diagnose_build_failure(output: str, venv_python: Path) -> str | None:
+    """Recognize common C-extension build failures and return an
+    actionable one-line hint, or None if nothing recognized.
+
+    These are system-package problems pip cannot fix on its own --
+    catching the common ones here saves a round trip through a confusing
+    raw traceback.
+    """
+    # Figure out which Python version the venv actually uses, so the hint
+    # names the right -dev package rather than guessing.
+    import re
+    match = re.search(r"python3\.(\d+)", str(venv_python))
+    py_suffix = f"python3.{match.group(1)}" if match else "python3"
+
+    if "Python.h: No such file or directory" in output:
+        return (
+            f"Missing Python development headers. Install them with:\n"
+            f"    sudo apt install {py_suffix}-dev\n"
+            f"then delete this repo's .swebench_venv and re-run."
+        )
+    if re.search(r"fatal error: [\w./]+\.h: No such file or directory", output):
+        missing_header = re.search(r"fatal error: ([\w./]+\.h): No such file or directory", output)
+        header_name = missing_header.group(1) if missing_header else "a header file"
+        return (
+            f"Missing a system header ({header_name}) needed to compile a C "
+            f"extension. This is usually a missing system dev package (e.g. "
+            f"`sudo apt install {py_suffix}-dev build-essential libfreetype6-dev "
+            f"libpng-dev` depending on which library it belongs to) -- check "
+            f"the full pip_install.log for which library's headers are missing."
+        )
+    if "gcc" in output.lower() and "command not found" in output.lower():
+        return "No C compiler found. Install one with: sudo apt install build-essential"
+    if "No module named 'Cython'" in output or "No module named 'cython'" in output:
+        return "Cython wasn't actually available at build time -- this usually means the pyproject.toml build requirements install (above) failed silently; check pip_install.log for that step."
+
+    return None
 
 
 def save_logs(log_path: str | Path, log_entries: list[dict]) -> None:
@@ -551,4 +791,3 @@ def evaluate_fail_to_pass(
         "fail_to_pass_total": len(fail_to_pass),
         "pass_to_pass_total": len(pass_to_pass),
     }
-

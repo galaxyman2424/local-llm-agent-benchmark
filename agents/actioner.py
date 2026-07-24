@@ -1,7 +1,9 @@
 """Actioner module providing a unified interface for all agent actions."""
 
+from __future__ import annotations
 import json
 from typing import Any
+from .ollama_client import OllamaClient
 
 
 class Actioner:
@@ -11,13 +13,17 @@ class Actioner:
     including file operations, code search, command execution, and test running.
     """
 
-    def __init__(self, model_id: str = "ornith:9b", workspace_dir: str | None = None):
-        # model_id is accepted for interface symmetry with Reasoner and so
-        # config-driven callers (e.g. experiments/run_experiment.py) can pass
-        # an actioner model name; the Actioner itself doesn't call an LLM
-        # directly today; it just executes concrete tool calls handed to it.
+    def __init__(
+        self,
+        model_id="ornith:9b",
+        workspace_dir=None,
+    ):
         self.model_id = model_id
         self.workspace_dir = workspace_dir or "."
+        self.client = OllamaClient(
+            model=model_id,
+            timeout_seconds=120.0,
+        )
         self._history = []
 
     def _resolve_path(self, path: str) -> str:
@@ -164,3 +170,80 @@ class Actioner:
     def get_history(self) -> list[dict]:
         """Return the execution history."""
         return self._history
+
+    def plan_action(
+        self,
+        task: str,
+        reasoner_plan: dict,
+        previous_actions: list[dict],
+    ) -> dict | None:
+        prompt = """
+        You are an action executor operating inside the provided workspace.
+
+        You must modify ONLY the current workspace.
+
+        Never invent an absolute path.
+        Never use /home/user.
+        Never use a path from an example or previous task.
+
+        For file operations, always use paths relative to the workspace.
+
+        Available tools:
+        - read_file
+        - write_to_file
+        - replace_in_file
+        - delete_file
+        - list_directory
+        - search_code
+        - run_command
+        - run_tests
+        - get_git_diff
+
+        Return exactly one JSON object and nothing else.
+
+        The JSON format MUST be:
+
+        {
+        "tool": "tool_name",
+        "parameters": {
+            ...
+        }
+        }
+
+        Do not put the tool parameters at the top level.
+
+        For write_to_file, only write a file when the reasoner explicitly requests it.
+        Prefer replace_in_file for modifying an existing file.
+        Never generate unrelated example projects.
+        """
+
+        response = self.client.chat(
+            [
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            temperature=0.1,
+            json_mode=True,
+            num_predict=512,
+            think=False,
+        )
+
+        text = response["message"]["content"]
+
+        if not text.strip():
+            print("[Actioner] Ollama returned empty content.")
+            return None
+
+        action = self.actioner.plan_action(
+            task=task,
+            reasoner_plan=reasoner_plan,
+            previous_actions=previous_actions,
+        )
+
+        if not action:
+            print("[Agent] Actioner failed to produce a valid tool call.")
+            continue
+
+        return action

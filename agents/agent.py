@@ -64,9 +64,7 @@ class Agent:
         self.actioner.workspace_dir = repo_path
 
         iterations: list[IterationResult] = []
-        previous_actions: list[dict] = []
         total_tool_calls = 0
-        final_patch = ""
         test_passed: bool | None = None
 
         current_state: dict = {
@@ -74,55 +72,78 @@ class Agent:
             "test_command": test_command,
         }
 
+        previous_actions = []
+        test_passed = None
+        final_patch = ""
+
+        # Main agent loop
         for i in range(self.max_iterations):
-            # 1. Reasoner produces the next action given task + state + history
-            plan = self.reasoner.plan(task, current_state, previous_actions)
-            if not plan:
+
+            # 1. Reasoner creates plan
+            reasoner_plan = self.reasoner.plan(
+                task,
+                current_state,
+                previous_actions,
+            )
+
+            if not reasoner_plan:
+                print("[Agent] Reasoner failed to produce a plan.")
                 break
 
-            tool_call = plan.get("next_action", "")
-            parameters = plan.get("parameters", {})
+            # 2. Actioner creates concrete action
+            action = self.actioner.plan_action(
+                task=task,
+                reasoner_plan=reasoner_plan,
+                previous_actions=previous_actions,
+            )
 
-            if tool_call in ("submit_solution", "done", ""):
+            if not action:
+                print("[Agent] Actioner failed to produce a tool call.")
                 break
 
-            # 2. Actioner executes that action
-            action = {"tool": tool_call, "parameters": parameters}
+            # 3. Execute action
             try:
-                result = self.actioner.execute(action)
+                tool_result = self.actioner.execute(action)
             except Exception as e:
-                result = {"tool": tool_call, "error": str(e)}
-
-            success = "error" not in result
-            output = result.get("result", result.get("error", ""))
-            if isinstance(output, (dict, list)):
-                output = json.dumps(output)
-
-            iterations.append(IterationResult(i, tool_call, json.dumps(parameters), success, str(output)))
-            total_tool_calls += 1
-            previous_actions.append({**action, "result": result})
-
-            # Track test outcomes as they happen so we know when to stop.
-            if tool_call == "run_tests":
-                test_passed = result.get("returncode") == 0
-                current_state["last_test_result"] = {
-                    "returncode": result.get("returncode"),
-                    "stdout": str(result.get("result", ""))[:2000],
-                    "stderr": str(result.get("stderr", ""))[:2000],
+                tool_result = {
+                    "tool": action.get("tool", ""),
+                    "error": str(e),
                 }
+
+            # 4. Save history
+            previous_actions.append({
+                "reasoner_plan": reasoner_plan,
+                "action": action,
+                "result": tool_result,
+            })
+
+            # 5. Update state
+            current_state["last_action"] = action
+            current_state["last_result"] = tool_result
+
+            # 6. Check tests
+            if action.get("tool") == "run_tests":
+                test_passed = tool_result.get("returncode") == 0
+
                 if test_passed:
+                    print("[Agent] Tests passed.")
                     break
+        # =========================================================
+        # LOOP IS FINISHED
+        # Everything below happens ONCE, after the loop
+        # =========================================================
 
-            current_state["last_action"] = tool_call
-            current_state["last_output"] = str(output)[:2000]
-
-        # Capture whatever diff the agent produced, regardless of outcome.
+        # Capture final patch
         try:
-            diff_result = self.actioner.execute({"tool": "get_git_diff", "parameters": {}})
+            diff_result = self.actioner.execute({
+                "tool": "get_git_diff",
+                "parameters": {},
+            })
             final_patch = diff_result.get("result", "") or ""
         except Exception:
             final_patch = ""
 
+        # Determine final status
         if test_passed is None:
             status = "incomplete"
         elif test_passed:
@@ -130,12 +151,13 @@ class Agent:
         else:
             status = "failed"
 
+        # Build final AgentResult
         result = AgentResult(
-            instance_id="",       # filled by benchmark
-            repo_name="",         # filled by benchmark
-            base_commit="",       # filled by benchmark
-            num_iterations=len(iterations),
-            total_tool_calls=total_tool_calls,
+            instance_id="",
+            repo_name="",
+            base_commit="",
+            num_iterations=len(previous_actions),
+            total_tool_calls=len(previous_actions),
             test_passed=test_passed,
             final_patch=final_patch,
             status=status,

@@ -67,21 +67,46 @@ Provide your analysis as a structured JSON response with these fields:
         dict
             Structured plan with action steps and expected outcomes.
         """
-        prompt = f"""Analyze the following task and current state to determine what needs to be done next.
+        prompt = f"""You are the reasoning component of a software engineering agent.
 
-TASK: {task_description}
+        Your job is to select exactly ONE next tool action.
 
-CURRENT STATE:
-{current_state}
+        TASK:
+        {task_description}
 
-PREVIOUS ACTIONS TAKEN:
-{previous_actions}
+        CURRENT STATE:
+        {current_state}
 
-Return a structured plan as JSON with:
-- "next_action": The immediate next step (which tool to call)
-- "parameters": Arguments for that action
-- "expected_outcome": What should happen after this action"""
+        PREVIOUS ACTIONS:
+        {previous_actions}
 
+        Available tools:
+        - read_file
+        - write_to_file
+        - replace_in_file
+        - edit_file
+        - delete_file
+        - list_directory
+        - search_code
+        - run_command
+        - run_tests
+        - get_git_diff
+
+        Return ONLY a JSON object with exactly these fields:
+
+        {{
+        "next_action": "tool_name",
+        "parameters": {{}},
+        "expected_outcome": "short description"
+        }}
+
+        Rules:
+        - Select exactly one next action.
+        - Do not output Markdown.
+        - Do not output explanations outside the JSON.
+        - Keep the response concise.
+        - Do not repeat the task description.
+        """
         try:
             result = self._call_model(prompt)
             if isinstance(result, dict):
@@ -92,6 +117,7 @@ Return a structured plan as JSON with:
                 }
         except Exception as e:
             print(f"[Reasoner.plan] Falling back to heuristic plan: {e}")
+            return None
 
         # Fallback plan based on task description
         return {
@@ -118,14 +144,32 @@ Return a structured plan as JSON with:
         # isn't silently truncated mid-string by a low default token cap.
         response = client.chat(
             [{"role": "user", "content": prompt}],
+            temperature=0.1,
             json_mode=True,
-            num_predict=1024,
+            num_predict=4096,
+            keep_alive=0,
         )
-        text = response["message"]["content"]
+
+        message = response.get("message", {})
+        text = message.get("content", "")
+
+        if not text.strip():
+            print("[Reasoner] Ollama returned an empty content response.")
+            print("[Reasoner] Done reason: {}".format(
+                response.get("done_reason", "unknown")
+            ))
+            print("[Reasoner] Thinking length: {}".format(
+                len(message.get("thinking", ""))
+            ))
+            print("[Reasoner] Full response: {}".format(repr(response)))
+            return None
 
         candidate = _extract_json_object(text)
+        
         if candidate is None:
             print("[Reasoner] Model reply contained no JSON object")
+            print("[Reasoner] Raw model response:")
+            print(repr(text))
             return None
         try:
             return _json.loads(candidate)

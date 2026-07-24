@@ -106,7 +106,7 @@ def run_instance(
     # from workspace_dir specifically so tests import this instance's own
     # edited files, not a stale copy from the shared repo_path.
     from swebench.utils import ensure_repo_environment
-    python_bin = ensure_repo_environment(repo_path, install_path=workspace_dir)
+    python_bin, install_ok = ensure_repo_environment(repo_path, install_path=workspace_dir)
 
     # 5. Initialize the agent and give it the problem statement
     from agents import Reasoner, Actioner, Agent
@@ -141,6 +141,13 @@ def run_instance(
 
     # 7. Capture the final patch produced by the agent
     result.final_patch = agent_result.final_patch or get_git_diff(workspace_dir)
+
+    if not install_ok:
+        result.status = "environment_error"
+        result.test_results = {"error": "repo dependency installation failed; see .swebench_venv/pip_install.log"}
+        result.end_time = time.time()
+        result.runtime = result.end_time - result.start_time
+        return result
 
     # 8. Run tests on the patched repo (independent confirmation of pass/fail)
     proc = subprocess.run(
