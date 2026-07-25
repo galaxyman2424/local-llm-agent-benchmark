@@ -96,12 +96,26 @@ def run_experiment(
     reasoner_model = reasoner_model or config.get("reasoner", {}).get("model", "qwen3.5:9b")
     actioner_model = actioner_model or config.get("actioner", {}).get("model", "ornith:9b")
 
-    print(f"[Experiment] Initializing Reasoner (model={reasoner_model})...")
-    reasoner_timeout = config.get("agent", {}).get("timeout", 120.0)
-    reasoner = Reasoner(model_id=reasoner_model, timeout_seconds=reasoner_timeout)
+    # NOTE: these are per-LLM-request timeouts (how long a single Ollama
+    # call may take), deliberately distinct from `agent.timeout` below
+    # (the budget for the WHOLE task across all iterations). Conflating
+    # the two meant a 600s "agent timeout" was silently being used as a
+    # 120s single-request timeout, or vice versa.
+    reasoner_timeout = config.get("reasoner", {}).get("timeout_seconds", 120.0)
+    actioner_timeout = config.get("actioner", {}).get("timeout_seconds", 120.0)
+    # num_ctx (context window) is a SEPARATE knob from num_predict -- see
+    # agents/reasoner.py's DEFAULT_NUM_CTX docstring. Too small a value here
+    # is the actual cause of replies truncating mid-JSON, not num_predict.
+    reasoner_num_ctx = config.get("reasoner", {}).get("num_ctx", 16384)
+    actioner_num_ctx = config.get("actioner", {}).get("num_ctx", 16384)
 
-    print(f"[Experiment] Initializing Actioner (model={actioner_model})...")
-    actioner = Actioner(model_id=actioner_model)
+    print(f"[Experiment] Initializing Reasoner (model={reasoner_model}, request_timeout={reasoner_timeout}s, "
+          f"num_ctx={reasoner_num_ctx})...")
+    reasoner = Reasoner(model_id=reasoner_model, timeout_seconds=reasoner_timeout, num_ctx=reasoner_num_ctx)
+
+    print(f"[Experiment] Initializing Actioner (model={actioner_model}, request_timeout={actioner_timeout}s, "
+          f"num_ctx={actioner_num_ctx})...")
+    actioner = Actioner(model_id=actioner_model, timeout_seconds=actioner_timeout, num_ctx=actioner_num_ctx)
 
     agent_max_iter = config.get("agent", {}).get("max_iterations", 50)
     print(f"[Experiment] Agent max iterations: {agent_max_iter}")

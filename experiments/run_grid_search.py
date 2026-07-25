@@ -129,6 +129,8 @@ def run_grid_search(
                 "total_instances": 0,
                 "resolved": 0,
                 "resolve_rate": 0.0,
+                "errors": 1,
+                "run_time_seconds": 0.0,
                 "error": str(e),
                 "traceback": traceback.format_exc(),
             }

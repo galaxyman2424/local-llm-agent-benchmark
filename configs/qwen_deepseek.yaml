@@ -2,13 +2,15 @@ name: qwen_deepseek
 
 reasoner:
   model: qwen3.5:9b
+  timeout_seconds: 120  # max seconds for a single Ollama request
 
 actioner:
   model: deepseek-coder-v2:16b-instruct-q4_0
+  timeout_seconds: 120  # max seconds for a single Ollama request
 
 agent:
   max_iterations: 10
-  timeout: 600
+  timeout: 600  # max seconds for the WHOLE task (all iterations), not one LLM call
 
 benchmark:
   name: swebench_lite

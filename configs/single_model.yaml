@@ -2,13 +2,15 @@ name: single_model_qwen35_9b
 
 reasoner:
   model: qwen3.5:9b
+  timeout_seconds: 120  # max seconds for a single Ollama request
 
 actioner:
   model: qwen3.5:9b
+  timeout_seconds: 120  # max seconds for a single Ollama request
 
 agent:
   max_iterations: 10
-  timeout: 600
+  timeout: 600  # max seconds for the WHOLE task (all iterations), not one LLM call
 
 benchmark:
   name: swebench_lite

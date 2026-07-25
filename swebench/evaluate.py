@@ -58,7 +58,7 @@ def evaluate_instance(
     EvalResult
         The structured evaluation result.
     """
-    from swebench.utils import load_instance, get_git_diff, evaluate_fail_to_pass
+    from swebench.utils import load_instance, get_git_diff, evaluate_fail_to_pass, ensure_repo_environment
 
     # Load instance metadata whenever we can, since we need it for the
     # test_command regardless of whether repo_path was already supplied.
@@ -102,9 +102,21 @@ def evaluate_instance(
         result.evaluation_time = time.time() - start_time
         return result
 
+    # Ensure this repo's own isolated virtualenv (with the package and its
+    # test-only dependencies installed) exists and use ITS python/pytest --
+    # the ambient interpreter typically doesn't even have the target
+    # package installed, which would fail every test with an import error
+    # regardless of what the agent did.
+    python_bin, install_ok = ensure_repo_environment(repo_path, install_path=repo_path)
+    if not install_ok:
+        result.status = "environment_error"
+        result.test_results = {"error": "repo dependency installation failed; see .swebench_venv/pip_install.log"}
+        result.evaluation_time = time.time() - start_time
+        return result
+
     # Quick sanity-check test_command run, kept for debugging visibility.
     # This is NOT the authoritative pass/fail signal -- see below.
-    test_cmd = instance.get("test_command", "pytest")
+    test_cmd = instance.get("test_command", f"{python_bin} -m pytest")
     import subprocess
     try:
         proc = subprocess.run(
@@ -125,7 +137,7 @@ def evaluate_instance(
     # resolution criterion), when the dataset actually provides those
     # lists for this instance.
     if instance.get("FAIL_TO_PASS") or instance.get("PASS_TO_PASS"):
-        f2p = evaluate_fail_to_pass(repo_path, instance, timeout=60)
+        f2p = evaluate_fail_to_pass(repo_path, instance, timeout=60, python_bin=python_bin)
         result.status = f2p["status"]
         result.fail_to_pass_count = f2p["fail_to_pass_count"]
         result.fail_to_pass_total = f2p["fail_to_pass_total"]

@@ -9,6 +9,12 @@ class OllamaClient:
 
     Supports both streaming and non-streaming chat completions.
     All methods raise ``RuntimeError`` on network or server errors.
+
+    This is the SINGLE client implementation used by both the Reasoner and
+    the Actioner -- do not duplicate this class elsewhere. Both components
+    should import it the same way::
+
+        from .ollama_client import OllamaClient
     """
 
     BASE_URL = "http://localhost:11434"
@@ -60,6 +66,7 @@ class OllamaClient:
         temperature: float = 0.7,
         json_mode: bool = False,
         num_predict: int | None = None,
+        num_ctx: int | None = None,
         keep_alive: str | int | None = None,
         think: bool | None = None,
     ):
@@ -90,6 +97,32 @@ class OllamaClient:
             and silently truncate the response mid-string -- if you're
             seeing "Unterminated string" JSON errors, try setting this
             higher (e.g. 512-1024).
+        num_ctx
+            Total context window size (prompt tokens + generated tokens),
+            forwarded as Ollama's ``num_ctx`` option. THIS, not
+            ``num_predict``, is usually the real cause of mid-JSON
+            truncation: Ollama's default ``num_ctx`` is small (often
+            2048-4096 depending on the model/Modelfile), and a prompt that
+            embeds tool schemas, prior tool results, and repository state
+            can consume nearly all of that budget -- leaving almost no
+            room to generate before hitting the context ceiling, so
+            output stops mid-string well before ``num_predict`` would
+            ever kick in, and the exact cutoff point shifts between
+            retries as the prompt content shifts slightly. Set this
+            generously (e.g. 8192-16384) for any planning/action call
+            whose prompt embeds tool results or file contents.
+        keep_alive
+            Forwarded directly as Ollama's top-level ``keep_alive`` field
+            (e.g. ``0`` to unload the model immediately after the request,
+            or a duration string like ``"5m"`` to keep it warm). Useful
+            when grid-searching many models back to back on limited VRAM.
+        think
+            When the target model supports Ollama's "thinking" mode,
+            explicitly forces it on/off. For structured JSON planning
+            calls, pass ``think=False`` so the model doesn't spend its
+            entire ``num_predict`` budget on a hidden reasoning trace and
+            return empty ``content`` (``done_reason: "length"``). Left as
+            ``None``, Ollama's own per-model default is used.
 
         Returns
         -------
@@ -104,6 +137,9 @@ class OllamaClient:
         if num_predict is not None:
             options["num_predict"] = num_predict
 
+        if num_ctx is not None:
+            options["num_ctx"] = num_ctx
+
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -116,6 +152,9 @@ class OllamaClient:
 
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
+
+        if think is not None:
+            payload["think"] = think
 
         if not stream:
             result = self._request("POST", "/api/chat", payload)
