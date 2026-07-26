@@ -1,4 +1,4 @@
-"""Qwen-based Reasoner for task analysis and planning.
+"""Reasoner for task analysis and planning.
 
 The Reasoner is responsible ONLY for deciding WHAT should happen next. It
 never executes tools itself -- it hands a structured plan to the Actioner,
@@ -282,10 +282,11 @@ def _format_previous_actions(previous_actions: list[dict], *, last_n: int = 5) -
     for record in recent:
         action = record.get("action", {})
         result = record.get("result", {})
+        result_text = str(result.get("result", result.get("error", "")))
         lines.append(
             f"- tool={action.get('tool')} params={action.get('parameters')} "
             f"-> success={'error' not in result} "
-            f"result={str(result.get('result', result.get('error', '')))[:500]}"
+            f"result={result_text[:4000]}"  # was [:500] — was hiding almost all read_file content
         )
     return "\n".join(lines)
 
