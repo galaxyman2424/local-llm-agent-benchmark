@@ -127,7 +127,10 @@ class Agent:
             last_action_key = action_key
 
             if repeated_action_count >= MAX_REPEATED_ACTIONS:
-                print("[Agent] Same action repeated too many times without progress; stopping.")
+                print(f"[Agent] Same action repeated {MAX_REPEATED_ACTIONS}x without progress; stopping.")
+                print(f"[Agent] Stuck action: tool={action.get('tool')} parameters={action.get('parameters')}")
+                if previous_actions:
+                    print(f"[Agent] Last result: {str(previous_actions[-1].get('result'))[:500]}")
                 break
 
             # 5. Execute the concrete tool call (deterministic)

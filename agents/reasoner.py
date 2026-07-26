@@ -85,6 +85,14 @@ Provide your analysis as a structured JSON response with these fields:
         current_state: dict[str, Any],
         previous_actions: list[dict],
     ) -> dict[str, Any] | None:
+
+        already_read = _already_read_files(previous_actions)
+        already_read_block = (
+            f"\nFILES ALREADY READ THIS RUN (do NOT read_file these again unless "
+            f"you just edited them and need to re-check): {already_read}\n"
+            if already_read else ""
+        )
+
         """Generate the next single action to take.
 
         Parameters
@@ -201,7 +209,7 @@ Return only the JSON object, nothing else."""
         try:
             response = client.chat(
                 [{"role": "user", "content": prompt}],
-                temperature=0.1,
+                temperature=0.3,
                 json_mode=True,
                 num_predict=num_predict,
                 num_ctx=self.num_ctx,
@@ -324,4 +332,14 @@ def _json_stable(value: Any) -> str:
         return repr(value)
 
 
-
+def _already_read_files(previous_actions: list[dict]) -> list[str]:
+    """Files successfully read at least once this run."""
+    seen = []
+    for record in previous_actions:
+        action = record.get("action", {})
+        result = record.get("result", {})
+        if action.get("tool") == "read_file" and "error" not in result:
+            path = action.get("parameters", {}).get("path")
+            if path and path not in seen:
+                seen.append(path)
+    return seen
