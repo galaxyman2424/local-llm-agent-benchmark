@@ -2,11 +2,11 @@ name: qwen_ornith
 
 reasoner:
   model: qwen3.5:9b
-  timeout_seconds: 300  # max seconds for a single Ollama request
+  timeout_seconds: 3000  # max seconds for a single Ollama request
 
 actioner:
   model: ornith:9b
-  timeout_seconds: 300  # max seconds for a single Ollama request
+  timeout_seconds: 3000  # max seconds for a single Ollama request
 
 agent:
   max_iterations: 50

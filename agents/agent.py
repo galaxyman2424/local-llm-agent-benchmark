@@ -80,11 +80,20 @@ class Agent:
         for iteration in range(self.max_iterations):
             num_iterations = iteration + 1
 
+            # If the last executed action repeated at least once, tell the
+            # Reasoner explicitly to avoid it -- don't wait for the
+            # 2-repeat _loop_warning threshold in reasoner.py, since by
+            # then the model has already committed to the pattern once.
+            avoid_action = None
+            if repeated_action_count >= 1 and last_action_key is not None:
+                avoid_action = last_action_key
+
             # 1. Reasoner decides what to do
             reasoner_plan = self.reasoner.plan(
                 task=task,
                 current_state=current_state,
                 previous_actions=previous_actions,
+                avoid_action=avoid_action,
             )
 
             if not reasoner_plan:
@@ -155,7 +164,7 @@ class Agent:
             current_state["last_plan"] = reasoner_plan
             current_state["last_action"] = action
             current_state["last_result"] = result   # <-- the full file content lands HERE, last
-            
+
             # 8. Check test results
             if action.get("tool") == "run_tests":
                 test_passed = result.get("returncode") == 0

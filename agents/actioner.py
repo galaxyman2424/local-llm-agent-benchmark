@@ -249,6 +249,10 @@ class Actioner:
         next_action = reasoner_plan.get("next_action", "")
         reasoner_params = reasoner_plan.get("parameters", {}) or {}
 
+        print("=" * 20, "ACTIONER PROMPT", "=" * 20)
+        print(prompt)
+        print("=" * 60)
+
         prompt = f"""You are an action executor operating inside a single, fixed workspace.
 
 You are operating in this workspace:
@@ -361,5 +365,8 @@ Do not put the tool parameters at the top level.
             print(f"[Actioner] Rejected invalid action from model: {error}")
             print(f"[Actioner] Raw action: {action!r}")
             return None
+
+
+        print(f"[Actioner] Chose: {action}")
 
         return action

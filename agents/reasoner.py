@@ -84,6 +84,7 @@ Provide your analysis as a structured JSON response with these fields:
         task: str,
         current_state: dict[str, Any],
         previous_actions: list[dict],
+        avoid_action: tuple[str, str] | None = None,  # (tool, json_stringified_params)
     ) -> dict[str, Any] | None:
 
         already_read = _already_read_files(previous_actions)
@@ -92,6 +93,17 @@ Provide your analysis as a structured JSON response with these fields:
             f"you just edited them and need to re-check): {already_read}\n"
             if already_read else ""
         )
+
+        avoid_block = ""
+        if avoid_action is not None:
+            avoid_tool, avoid_params = avoid_action
+            avoid_block = f"""
+        HARD CONSTRAINT: You are FORBIDDEN from choosing this exact action again
+        right now -- you already did this and it made no further progress:
+            tool={avoid_tool} parameters={avoid_params}
+        You MUST pick a genuinely different tool call (or "done"). Re-reading a
+        file you already have the full contents of is NOT allowed.
+        """
 
         """Generate the next single action to take.
 
@@ -213,7 +225,7 @@ Return only the JSON object, nothing else."""
         try:
             response = client.chat(
                 [{"role": "user", "content": prompt}],
-                temperature=0.3,
+                temperature=0.6,
                 json_mode=True,
                 num_predict=num_predict,
                 num_ctx=self.num_ctx,
@@ -327,7 +339,21 @@ Previous result:
 You MUST choose a different action or inspect a more specific file/query
 than before. Do not repeat the same tool call with the same parameters.
 """
-
+def _already_read_files(previous_actions: list[dict]) -> list[str]:
+    """Return paths that were successfully read_file'd anywhere in history
+    (not just the last N shown in _format_previous_actions), so the
+    Reasoner has an explicit checklist even once a file scrolls out of the
+    'recent actions' window.
+    """
+    seen: list[str] = []
+    for record in previous_actions:
+        action = record.get("action", {})
+        result = record.get("result", {})
+        if action.get("tool") == "read_file" and "error" not in result:
+            path = (action.get("parameters") or {}).get("path")
+            if path and path not in seen:
+                seen.append(path)
+    return seen
 
 def _json_stable(value: Any) -> str:
     import json as _json
