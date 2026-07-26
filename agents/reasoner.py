@@ -185,6 +185,10 @@ Return only the JSON object, nothing else."""
             print("[Reasoner.plan] No usable plan after retry; giving up for this iteration.")
             return None
 
+        print("=" * 20, "REASONER PROMPT", "=" * 20)
+        print(prompt)
+        print("=" * 60)
+
         return {
             "next_action": result.get("next_action", result.get("action", "search_code")),
             "parameters": result.get("parameters", result.get("params", {})),

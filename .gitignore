@@ -6,4 +6,5 @@
 /seed_repos/swe_bench_lite/repos/
 
 .venv/
+/.venv/
 

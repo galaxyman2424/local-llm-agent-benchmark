@@ -150,10 +150,12 @@ class Agent:
             })
 
             # 7. Update state
+            current_state["repo_path"] = ...       # set once, early
+            current_state["test_command"] = ...    # set once, early
             current_state["last_plan"] = reasoner_plan
             current_state["last_action"] = action
-            current_state["last_result"] = result
-
+            current_state["last_result"] = result   # <-- the full file content lands HERE, last
+            
             # 8. Check test results
             if action.get("tool") == "run_tests":
                 test_passed = result.get("returncode") == 0
