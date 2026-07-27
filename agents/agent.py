@@ -86,6 +86,7 @@ class Agent:
         current_state: dict = {
             "repo_path": repo_path,
             "test_command": test_command,
+            "file_cache": {}
         }
 
         num_iterations = 0
@@ -142,14 +143,28 @@ class Agent:
                 break
 
             is_valid, error = validate_action(action)
-            if not is_valid:
-                print(f"[Agent] Actioner produced an invalid tool call, skipping execution: {error}")
+            if _is_cached_read(current_state, action):
+                path = (action.get("parameters") or {}).get("path")
+
+                print(
+                    "[Agent] Rejecting redundant read_file for cached file: {}".format(
+                        path
+                    )
+                )
+
                 previous_actions.append({
                     "iteration": iteration,
                     "reasoner_plan": reasoner_plan,
                     "action": action,
-                    "result": {"tool": action.get("tool", ""), "error": error},
+                    "result": {
+                        "tool": "read_file",
+                        "error": (
+                            "File is already cached. Do not read it again. "
+                            "Use the cached file contents in the Reasoner context."
+                        ),
+                    },
                 })
+
                 continue
 
             # 4. Loop detection: same tool+parameters repeated too often
@@ -169,25 +184,33 @@ class Agent:
             try:
                 result = self.actioner.execute(action)
             except Exception as e:
-                result = {"tool": action.get("tool", ""), "error": str(e)}
+                result = {
+                    "tool": action.get("tool", ""),
+                    "error": str(e),
+                }
 
             total_tool_calls += 1
             last_reasoner_plan = reasoner_plan
             last_action, last_result = action, result
 
+            # 5a. Update the persistent file cache.
+            _update_file_cache(current_state, action, result)
 
-            # 6. Save complete history (real tool output, not just the name)
+
+            ## 6. Update persistent state, including the file cache.
+            _update_file_cache(current_state, action, result)
+
+            current_state["last_plan"] = reasoner_plan
+            current_state["last_action"] = action
+            current_state["last_result"] = result
+
+            # 7. Save complete history.
             previous_actions.append({
                 "iteration": iteration,
                 "reasoner_plan": reasoner_plan,
                 "action": action,
                 "result": result,
             })
-
-            # 7. Update state
-            current_state["last_plan"] = reasoner_plan
-            current_state["last_action"] = action
-            current_state["last_result"] = result   # <-- the full file content lands HERE, last
 
             # 8. Check test results
             if action.get("tool") == "run_tests":
@@ -240,3 +263,58 @@ def _stable_repr(value) -> str:
         return _json.dumps(value, sort_keys=True)
     except TypeError:
         return repr(value)
+
+def _update_file_cache(
+    current_state: dict,
+    action: dict,
+    result: dict,
+) -> None:
+    """Update cached file contents based on a successfully executed action.
+
+    Successful read_file actions populate the cache.
+    File-modifying actions invalidate the corresponding cached entry so the
+    Reasoner cannot make decisions using stale file contents.
+    """
+    tool = action.get("tool")
+    parameters = action.get("parameters") or {}
+    path = parameters.get("path")
+
+    if not path:
+        return
+
+    file_cache = current_state.setdefault("file_cache", {})
+
+    # A successful read_file gives us authoritative file contents.
+    if tool == "read_file":
+        if "error" not in result:
+            content = result.get("result", "")
+
+            if isinstance(content, str):
+                file_cache[path] = content
+
+        return
+
+    # Any tool that modifies an existing file invalidates the cached version.
+    if tool in {
+        "replace_in_file",
+        "write_to_file",
+    }:
+        file_cache.pop(path, None)
+
+def _is_cached_read(
+    current_state: dict,
+    action: dict,
+) -> bool:
+    """Return True if read_file targets a file already in the cache."""
+    if action.get("tool") != "read_file":
+        return False
+
+    parameters = action.get("parameters") or {}
+    path = parameters.get("path")
+
+    if not path:
+        return False
+
+    file_cache = current_state.get("file_cache", {})
+
+    return path in file_cache

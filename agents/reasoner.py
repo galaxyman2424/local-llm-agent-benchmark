@@ -112,12 +112,8 @@ Provide your analysis as a structured JSON response with these fields:
         """
         loop_warning = _loop_warning(previous_actions)
 
-        already_read = _already_read_files(previous_actions)
-        already_read_block = (
-            f"\nFILES ALREADY READ THIS RUN (do NOT read_file these again unless "
-            f"you just edited them and need to re-check): {already_read}\n"
-            if already_read else ""
-        )
+        file_cache = current_state.get("file_cache", {})
+        file_cache_block = _format_file_cache(file_cache)
 
         avoid_block = ""
         if avoid_action is not None:
@@ -138,9 +134,12 @@ into a concrete tool call.
 
 TASK:
 {task}
-{already_read_block}
+
 CURRENT STATE:
-{_truncate(current_state)}
+{_truncate(_state_without_file_cache(current_state))}
+
+CACHED FILE CONTENTS:
+{file_cache_block}
 
 RECENT PREVIOUS ACTIONS AND THEIR RESULTS (most recent last):
 {_truncate(_format_previous_actions(previous_actions))}
@@ -225,7 +224,7 @@ Return only the JSON object, nothing else."""
         try:
             response = client.chat(
                 [{"role": "user", "content": prompt}],
-                temperature=0.6,
+                temperature=temperature,
                 json_mode=True,
                 num_predict=num_predict,
                 num_ctx=self.num_ctx,
@@ -289,21 +288,44 @@ def _truncate(value: Any) -> str:
     return text
 
 
-def _format_previous_actions(previous_actions: list[dict], *, last_n: int = 5) -> str:
-    """Render the most recent previous actions (with real tool results)."""
+def _format_previous_actions(
+    previous_actions: list[dict],
+    *,
+    last_n: int = 5,
+) -> str:
+    """Render recent previous actions without duplicating cached file contents."""
     if not previous_actions:
         return "(none yet)"
+
     recent = previous_actions[-last_n:]
     lines = []
+
     for record in recent:
         action = record.get("action", {})
         result = record.get("result", {})
+
+        tool = action.get("tool")
+        parameters = action.get("parameters", {})
         result_text = str(result.get("result", result.get("error", "")))
+
+        if tool == "read_file" and "error" not in result:
+            path = parameters.get("path", "(unknown)")
+            result_display = (
+                "[file contents cached under path '{}'; "
+                "see CACHED FILE CONTENTS above]"
+            ).format(path)
+        else:
+            result_display = result_text[:4000]
+
         lines.append(
-            f"- tool={action.get('tool')} params={action.get('parameters')} "
-            f"-> success={'error' not in result} "
-            f"result={result_text[:4000]}"  # was [:500] — was hiding almost all read_file content
+            "- tool={} params={} -> success={} result={}".format(
+                tool,
+                parameters,
+                "error" not in result,
+                result_display,
+            )
         )
+
     return "\n".join(lines)
 
 
@@ -339,21 +361,6 @@ Previous result:
 You MUST choose a different action or inspect a more specific file/query
 than before. Do not repeat the same tool call with the same parameters.
 """
-def _already_read_files(previous_actions: list[dict]) -> list[str]:
-    """Return paths that were successfully read_file'd anywhere in history
-    (not just the last N shown in _format_previous_actions), so the
-    Reasoner has an explicit checklist even once a file scrolls out of the
-    'recent actions' window.
-    """
-    seen: list[str] = []
-    for record in previous_actions:
-        action = record.get("action", {})
-        result = record.get("result", {})
-        if action.get("tool") == "read_file" and "error" not in result:
-            path = (action.get("parameters") or {}).get("path")
-            if path and path not in seen:
-                seen.append(path)
-    return seen
 
 def _json_stable(value: Any) -> str:
     import json as _json
@@ -362,4 +369,52 @@ def _json_stable(value: Any) -> str:
     except TypeError:
         return repr(value)
 
+def _format_file_cache(
+    file_cache: dict[str, str],
+    *,
+    max_file_chars: int = 8000,
+    max_total_chars: int = 24000,
+) -> str:
+    """Render cached file contents for the Reasoner prompt.
 
+    The Reasoner gets actual file contents instead of only a list of paths.
+    Individual files and the total cache are capped to avoid exhausting the
+    model's context window.
+    """
+    if not file_cache:
+        return "(no files cached yet)"
+
+    sections = []
+    total_chars = 0
+
+    for path, content in file_cache.items():
+        content = str(content)
+
+        if len(content) > max_file_chars:
+            content = (
+                content[:max_file_chars]
+                + "\n... [file content truncated for prompt]"
+            )
+
+        section = "FILE: {}\n{}\n".format(path, content)
+
+        if total_chars + len(section) > max_total_chars:
+            remaining = max_total_chars - total_chars
+
+            if remaining > 100:
+                sections.append(
+                    section[:remaining]
+                    + "\n... [remaining cached files omitted]"
+                )
+
+            break
+
+        sections.append(section)
+        total_chars += len(section)
+
+    return "\n".join(sections)
+
+def _state_without_file_cache(current_state: dict[str, Any]) -> dict[str, Any]:
+    state = dict(current_state)
+    state.pop("file_cache", None)
+    return state
