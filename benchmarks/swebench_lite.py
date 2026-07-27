@@ -282,6 +282,11 @@ class SWEBenchLite:
         record["total_tool_calls"] = getattr(agent_result, "total_tool_calls", 0) or 0
         record["final_patch"] = getattr(agent_result, "final_patch", "") or ""
 
+        record["stop_reason"] = getattr(agent_result, "stop_reason", "") if agent_result else ""
+        record["last_tool"] = (getattr(agent_result, "last_action", None) or {}).get("tool")
+        record["last_expected_outcome"] = (getattr(agent_result, "last_reasoner_plan", None) or {}).get("expected_outcome", "")
+        record["history"] = getattr(agent_result, "history", None) or []
+
         return record
 
     def run(

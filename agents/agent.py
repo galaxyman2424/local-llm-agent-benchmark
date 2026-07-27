@@ -14,6 +14,17 @@ STOP_ACTIONS = ("done", "submit_solution")
 # produced before the loop gives up rather than burning iterations.
 MAX_REPEATED_ACTIONS = 4
 
+# Every distinct way the loop can end -- makes "incomplete"/"timeout"
+# statuses actually explain themselves instead of just being a dead end.
+STOP_REASONS = (
+    "tests_passed",
+    "reasoner_done",       # Reasoner explicitly chose "done"/"submit_solution"
+    "reasoner_failed",     # Reasoner returned no usable plan (after its own retry)
+    "actioner_failed",     # Actioner couldn't produce a valid tool call
+    "repeated_action",     # Same (tool, parameters) fired too many times
+    "max_iterations",      # Ran out of budget
+)
+
 
 @dataclass
 class AgentResult:
@@ -43,6 +54,12 @@ class AgentResult:
     final_patch: str = ""
     status: str = "incomplete"  # passed, failed, incomplete, timeout, error
 
+    # NEW: diagnostic fields showing where the agent left off
+    stop_reason: str = ""            # see STOP_REASONS below
+    last_reasoner_plan: dict = field(default_factory=dict)
+    last_action: dict = field(default_factory=dict)
+    last_result: dict = field(default_factory=dict)
+    history: list = field(default_factory=list)
 
 class Agent:
     """Top-level agent that runs a task to completion.
@@ -76,6 +93,11 @@ class Agent:
         test_passed: bool | None = None
         repeated_action_count = 0
         last_action_key = None
+
+        stop_reason = "max_iterations"          # default if we exhaust the loop
+        last_reasoner_plan: dict = {}
+        last_action: dict = {}
+        last_result: dict = {}
 
         for iteration in range(self.max_iterations):
             num_iterations = iteration + 1
@@ -136,10 +158,8 @@ class Agent:
             last_action_key = action_key
 
             if repeated_action_count >= MAX_REPEATED_ACTIONS:
-                print(f"[Agent] Same action repeated {MAX_REPEATED_ACTIONS}x without progress; stopping.")
-                print(f"[Agent] Stuck action: tool={action.get('tool')} parameters={action.get('parameters')}")
-                if previous_actions:
-                    print(f"[Agent] Last result: {str(previous_actions[-1].get('result'))[:500]}")
+                print("[Agent] Same action repeated too many times without progress; stopping.")
+                stop_reason = "repeated_action"
                 break
 
             # 5. Execute the concrete tool call (deterministic)
@@ -149,6 +169,8 @@ class Agent:
                 result = {"tool": action.get("tool", ""), "error": str(e)}
 
             total_tool_calls += 1
+            last_action, last_result = action, result
+
 
             # 6. Save complete history (real tool output, not just the name)
             previous_actions.append({
@@ -199,16 +221,15 @@ class Agent:
             status = "failed"
 
         return AgentResult(
-            instance_id="",
-            repo_name="",
-            base_commit="",
-            num_iterations=num_iterations,
-            total_tool_calls=total_tool_calls,
-            test_passed=test_passed,
-            final_patch=final_patch,
-            status=status,
+            instance_id="", repo_name="", base_commit="",
+            num_iterations=num_iterations, total_tool_calls=total_tool_calls,
+            test_passed=test_passed, final_patch=final_patch, status=status,
+            stop_reason=stop_reason,
+            last_reasoner_plan=last_reasoner_plan,
+            last_action=last_action,
+            last_result=last_result,
+            history=previous_actions,
         )
-
 
 def _stable_repr(value) -> str:
     import json as _json

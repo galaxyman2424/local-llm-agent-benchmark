@@ -86,6 +86,31 @@ Provide your analysis as a structured JSON response with these fields:
         previous_actions: list[dict],
         avoid_action: tuple[str, str] | None = None,  # (tool, json_stringified_params)
     ) -> dict[str, Any] | None:
+        """Generate the next single action to take.
+
+        Parameters
+        ----------
+        task
+            The problem description from the SWE-bench instance.
+        current_state
+            Current repository/agent state (workspace, test command, last
+            result, etc.).
+        previous_actions
+            Full history of ``{"iteration", "reasoner_plan", "action",
+            "result"}`` records taken so far this run.
+        avoid_action
+            If set, ``(tool, json_stringified_params)`` of an action the
+            Agent detected repeating -- injected as a hard constraint and
+            paired with a higher sampling temperature.
+
+        Returns
+        -------
+        dict | None
+            ``{"next_action": ..., "parameters": ..., "expected_outcome": ...}``,
+            or ``None`` if the model could not be reached or produced no
+            usable plan after a retry.
+        """
+        loop_warning = _loop_warning(previous_actions)
 
         already_read = _already_read_files(previous_actions)
         already_read_block = (
@@ -98,49 +123,22 @@ Provide your analysis as a structured JSON response with these fields:
         if avoid_action is not None:
             avoid_tool, avoid_params = avoid_action
             avoid_block = f"""
-        HARD CONSTRAINT: You are FORBIDDEN from choosing this exact action again
-        right now -- you already did this and it made no further progress:
-            tool={avoid_tool} parameters={avoid_params}
-        You MUST pick a genuinely different tool call (or "done"). Re-reading a
-        file you already have the full contents of is NOT allowed.
-        """
-
-        """Generate the next single action to take.
-
-        Parameters
-        ----------
-        task
-            The problem description from the SWE-bench instance.
-        current_state
-            Current repository/agent state (workspace, test command, last
-            result, etc.).
-        previous_actions
-            Full history of ``{"iteration", "reasoner_plan", "action",
-            "result"}`` records taken so far this run -- actual tool
-            outputs, not just action names, so the Reasoner can see what
-            actually happened.
-
-        Returns
-        -------
-        dict | None
-            ``{"next_action": ..., "parameters": ..., "expected_outcome": ...}``.
-            ``next_action`` is either a tool name from ``TOOL_SCHEMAS`` or
-            the meta-action ``"done"`` to signal the Reasoner believes no
-            further action is needed (e.g. tests already pass). Returns
-            ``None`` if the model could not be reached or produced no
-            usable plan after a retry.
-        """
-        loop_warning = _loop_warning(previous_actions)
+HARD CONSTRAINT: You are FORBIDDEN from choosing this exact action again
+right now -- you already did this and it made no further progress:
+    tool={avoid_tool} parameters={avoid_params}
+You MUST pick a genuinely different tool call (or "done"). Re-reading a
+file you already have the full contents of is NOT allowed.
+"""
 
         prompt = f"""You are the reasoning component of a software engineering agent.
-
+{avoid_block}
 Your job is to select exactly ONE next action. You do NOT execute tools
 yourself -- a separate component (the Actioner) will translate your choice
 into a concrete tool call.
 
 TASK:
 {task}
-
+{already_read_block}
 CURRENT STATE:
 {_truncate(current_state)}
 
@@ -178,28 +176,29 @@ Rules:
 - Keep the response concise.
 - Do not repeat the task description.
 """
-        result = self._call_model(prompt)
+        print("=" * 20, "REASONER PROMPT", "=" * 20)
+        print(prompt)
+        print("=" * 60)
+
+        temperature = 0.6 if avoid_action is not None else 0.1
+
+        result = self._call_model(prompt, temperature=temperature)
         if result is None:
-            # One retry with a shorter, stripped-down prompt before giving up.
             print("[Reasoner.plan] Empty/invalid model reply, retrying once with a shorter prompt.")
             short_prompt = f"""You are the reasoning component of a software engineering agent.
 Select exactly ONE next action as JSON: {{"next_action": "tool_name_or_done", "parameters": {{}}, "expected_outcome": "..."}}
 
 TASK (truncated): {task[:400]}
-
+{avoid_block}
 Available tools:
 {schema_prompt_block()}
 
 Return only the JSON object, nothing else."""
-            result = self._call_model(short_prompt, num_predict=1024)
+            result = self._call_model(short_prompt, num_predict=1024, temperature=temperature)
 
         if not isinstance(result, dict):
             print("[Reasoner.plan] No usable plan after retry; giving up for this iteration.")
             return None
-
-        print("=" * 20, "REASONER PROMPT", "=" * 20)
-        print(prompt)
-        print("=" * 60)
 
         return {
             "next_action": result.get("next_action", result.get("action", "search_code")),
@@ -207,7 +206,8 @@ Return only the JSON object, nothing else."""
             "expected_outcome": result.get("expected_outcome", result.get("outcome", "")),
         }
 
-    def _call_model(self, prompt: str, *, num_predict: int = 4096) -> Any:
+
+    def _call_model(self, prompt: str, *, num_predict: int = 4096, temperature: float = 0.1) -> Any:
         """Call the reasoning model and parse its JSON reply into a dict.
 
         Returns ``None`` (rather than raising) if the model is unreachable,
@@ -363,14 +363,3 @@ def _json_stable(value: Any) -> str:
         return repr(value)
 
 
-def _already_read_files(previous_actions: list[dict]) -> list[str]:
-    """Files successfully read at least once this run."""
-    seen = []
-    for record in previous_actions:
-        action = record.get("action", {})
-        result = record.get("result", {})
-        if action.get("tool") == "read_file" and "error" not in result:
-            path = action.get("parameters", {}).get("path")
-            if path and path not in seen:
-                seen.append(path)
-    return seen

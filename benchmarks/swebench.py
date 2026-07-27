@@ -32,6 +32,12 @@ class InstanceRecord:
     fail_to_pass_results: dict = field(default_factory=dict)
     pass_to_pass_results: dict = field(default_factory=dict)
 
+    stop_reason: str = ""
+    last_reasoner_plan: dict = field(default_factory=dict)
+    last_action: dict = field(default_factory=dict)
+    last_result: dict = field(default_factory=dict)
+    history: list = field(default_factory=list)
+
 
 class SWEbenchBenchmark:
     """Manages the full benchmark lifecycle.
@@ -127,6 +133,12 @@ class SWEbenchBenchmark:
         test_cmd = task.get("test_command", "pytest")
         agent_result = agent.solve(str(repo_path), task_text, test_command=test_cmd)
 
+        record.stop_reason = getattr(agent_result, "stop_reason", "") if agent_result else ""
+        record.last_reasoner_plan = getattr(agent_result, "last_reasoner_plan", None) or {}
+        record.last_action = getattr(agent_result, "last_action", None) or {}
+        record.last_result = getattr(agent_result, "last_result", None) or {}
+        record.history = getattr(agent_result, "history", None) or []
+
         record.num_iterations = agent_result.num_iterations if agent_result else 0
         record.total_tool_calls = agent_result.total_tool_calls if agent_result else 0
         record.final_patch = agent_result.final_patch if agent_result else ""
@@ -190,17 +202,46 @@ class SWEbenchBenchmark:
         path = self.raw_results_dir / "results.jsonl"
         with open(path, "a") as f:
             for r in results:
-                f.write(json.dumps(r.__dict__) + "\n")
+                data = dataclasses.asdict(r) if dataclasses.is_dataclass(r) else r
+                f.write(json.dumps(data) + "\n")
         return path
 
     def save_processed(self, results: list[InstanceRecord]) -> Path:
-        """Aggregate and save processed summary."""
         self.processed_results_dir.mkdir(parents=True, exist_ok=True)
         total = len(results)
         resolved = sum(1 for r in results if r.status == "resolved")
+
         by_status: dict[str, int] = {}
+        by_stop_reason: dict[str, int] = {}
+        iterations_by_status: dict[str, list[int]] = {}
         for r in results:
             by_status[r.status] = by_status.get(r.status, 0) + 1
+            if r.stop_reason:
+                by_stop_reason[r.stop_reason] = by_stop_reason.get(r.stop_reason, 0) + 1
+            iterations_by_status.setdefault(r.status, []).append(r.num_iterations)
+
+        avg_iterations_by_status = {
+            status: round(sum(vals) / len(vals), 2)
+            for status, vals in iterations_by_status.items()
+        }
+
+        # Lightweight per-instance digest -- enough to see where each run left
+        # off without opening the full raw history for every instance.
+        instance_digests = [
+            {
+                "instance_id": r.instance_id,
+                "status": r.status,
+                "stop_reason": r.stop_reason,
+                "num_iterations": r.num_iterations,
+                "total_tool_calls": r.total_tool_calls,
+                "last_tool": (r.last_action or {}).get("tool"),
+                "last_expected_outcome": (r.last_reasoner_plan or {}).get("expected_outcome", ""),
+                "fail_to_pass": f"{r.fail_to_pass_count}/{r.fail_to_pass_total}" if r.fail_to_pass_total else None,
+                "pass_to_pass": f"{r.pass_to_pass_count}/{r.pass_to_pass_total}" if r.pass_to_pass_total else None,
+            }
+            for r in results
+        ]
+
         path = self.processed_results_dir / "summary.json"
         with open(path, "w") as f:
             json.dump({
@@ -208,6 +249,9 @@ class SWEbenchBenchmark:
                 "resolved": resolved,
                 "resolve_rate": resolved / total if total else 0.0,
                 "by_status": by_status,
-                "results": [r.__dict__ for r in results],
+                "by_stop_reason": by_stop_reason,
+                "avg_iterations_by_status": avg_iterations_by_status,
+                "instances": instance_digests,
+                "results": [r.__dict__ for r in results],  # full detail, incl. history
             }, f, indent=2)
         return path

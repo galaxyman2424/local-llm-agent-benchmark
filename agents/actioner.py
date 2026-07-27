@@ -249,10 +249,6 @@ class Actioner:
         next_action = reasoner_plan.get("next_action", "")
         reasoner_params = reasoner_plan.get("parameters", {}) or {}
 
-        print("=" * 20, "ACTIONER PROMPT", "=" * 20)
-        print(prompt)
-        print("=" * 60)
-
         prompt = f"""You are an action executor operating inside a single, fixed workspace.
 
 You are operating in this workspace:
@@ -295,6 +291,11 @@ The JSON format MUST be:
 
 Do not put the tool parameters at the top level.
 """
+
+        print("=" * 20, "ACTIONER PROMPT", "=" * 20)
+        print(prompt)
+        print("=" * 60)
+
 
         try:
             response = self.client.chat(

@@ -192,10 +192,22 @@ def run_experiment(
     total = len(selected_instances)
     error_count = sum(1 for r in results if not isinstance(r, InstanceRecord))
     by_status: dict[str, int] = {}
+
+
+    by_stop_reason: dict[str, int] = {}
+    instance_digests = []
     for r in results:
         if isinstance(r, InstanceRecord):
-            by_status[r.status] = by_status.get(r.status, 0) + 1
-
+            if r.stop_reason:
+                by_stop_reason[r.stop_reason] = by_stop_reason.get(r.stop_reason, 0) + 1
+            instance_digests.append({
+                "instance_id": r.instance_id,
+                "status": r.status,
+                "stop_reason": r.stop_reason,
+                "num_iterations": r.num_iterations,
+                "last_tool": (r.last_action or {}).get("tool"),
+            })
+    
     summary = {
         "experiment_config": config_path,
         "reasoner_model": reasoner_model,
@@ -206,6 +218,8 @@ def run_experiment(
         "by_status": by_status,
         "errors": error_count,
         "run_time_seconds": round(run_time, 2),
+        "by_stop_reason": by_stop_reason,
+        "instances": instance_digests,
     }
 
     results_processed_dir.mkdir(parents=True, exist_ok=True)
