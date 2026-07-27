@@ -120,11 +120,13 @@ class Agent:
 
             if not reasoner_plan:
                 print("[Agent] Reasoner failed to produce a plan.")
+                stop_reason = "reasoner_failed"
                 break
 
             # 2. Stop conditions from the Reasoner
             if reasoner_plan.get("next_action") in STOP_ACTIONS:
                 print(f"[Agent] Reasoner signaled '{reasoner_plan.get('next_action')}'; stopping.")
+                stop_reason = "reasoner_done"
                 break
 
             # 3. Actioner translates plan into exactly one concrete tool call
@@ -136,6 +138,7 @@ class Agent:
 
             if not action:
                 print("[Agent] Actioner failed to produce a valid tool call.")
+                stop_reason = "actioner_failed"
                 break
 
             is_valid, error = validate_action(action)
@@ -169,6 +172,7 @@ class Agent:
                 result = {"tool": action.get("tool", ""), "error": str(e)}
 
             total_tool_calls += 1
+            last_reasoner_plan = reasoner_plan
             last_action, last_result = action, result
 
 
@@ -181,8 +185,6 @@ class Agent:
             })
 
             # 7. Update state
-            current_state["repo_path"] = ...       # set once, early
-            current_state["test_command"] = ...    # set once, early
             current_state["last_plan"] = reasoner_plan
             current_state["last_action"] = action
             current_state["last_result"] = result   # <-- the full file content lands HERE, last
@@ -197,6 +199,7 @@ class Agent:
                 }
                 if test_passed:
                     print("[Agent] Tests passed.")
+                    stop_reason = "tests_passed"
                     break
 
         # =========================================================
