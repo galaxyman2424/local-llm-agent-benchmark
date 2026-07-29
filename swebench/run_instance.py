@@ -118,7 +118,8 @@ def run_instance(
 
     reasoner_timeout = agent_config.get("timeout") or agent_config.get("agent", {}).get("timeout", 120.0)
     reasoner = Reasoner(model_id=reasoner_model, timeout_seconds=reasoner_timeout)
-    actioner = Actioner(model_id=actioner_model, workspace_dir=str(workspace_dir))
+    actioner_timeout = agent_config.get("actioner", {}).get("timeout_seconds", 120.0)
+    actioner = Actioner(model_id=actioner_model, workspace_dir=str(workspace_dir), timeout_seconds=actioner_timeout)
     agent = Agent(reasoner, actioner, max_iterations=max_iterations)
 
     start_time = time.time()

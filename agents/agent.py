@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-
+from collections import deque
 from .tool_schemas import validate_action
 
 # Meta-actions the Reasoner may choose that are NOT tool calls and should
@@ -100,6 +100,10 @@ class Agent:
         last_action: dict = {}
         last_result: dict = {}
 
+        #oscillation detection window + test-staleness tracking
+        action_window: deque = deque(maxlen=8)
+        last_test_iteration = -999
+
         for iteration in range(self.max_iterations):
             num_iterations = iteration + 1
 
@@ -111,12 +115,24 @@ class Agent:
             if repeated_action_count >= 1 and last_action_key is not None:
                 avoid_action = last_action_key
 
-            # 1. Reasoner decides what to do
+            #nudge toward running tests if changes are piling up untested
+            has_changes = bool(previous_actions) and any(
+                r["action"].get("tool") in ("write_to_file", "replace_in_file")
+                for r in previous_actions
+            )
+            stagnation_hint = None
+            if has_changes and (iteration - last_test_iteration) > 6:
+                stagnation_hint = (
+                    "You have made file changes but have not run tests in over "
+                    "6 iterations. Strongly consider choosing run_tests next."
+                )
+
             reasoner_plan = self.reasoner.plan(
                 task=task,
                 current_state=current_state,
                 previous_actions=previous_actions,
                 avoid_action=avoid_action,
+                stagnation_hint=stagnation_hint,   # NEW
             )
 
             if not reasoner_plan:
@@ -136,11 +152,16 @@ class Agent:
                 reasoner_plan=reasoner_plan,
                 previous_actions=previous_actions,
             )
-
+            
             if not action:
-                print("[Agent] Actioner failed to produce a valid tool call.")
-                stop_reason = "actioner_failed"
-                break
+                fallback = {"tool": reasoner_plan.get("next_action"), "parameters": reasoner_plan.get("parameters", {})}
+                is_valid, _ = validate_action(fallback)
+                if is_valid:
+                    print("[Agent] Actioner failed; using Reasoner's plan directly as fallback.")
+                    action = fallback
+                else:
+                    stop_reason = "actioner_failed"
+                    break
 
             is_valid, error = validate_action(action)
             if _is_cached_read(current_state, action):
@@ -152,16 +173,30 @@ class Agent:
                     )
                 )
 
+                # Instead of returning an error, present the cached contents
+                # as the result so the Reasoner sees the file content in the
+                # previous_actions history and does not repeatedly request it.
+                file_cache = current_state.get("file_cache", {})
+                cached = file_cache.get(path)
+                cached_text = ""
+                if isinstance(cached, str):
+                    cached_text = cached
+                elif isinstance(cached, dict):
+                    if cached.get("type") == "full":
+                        cached_text = cached.get("content", "")
+                    elif cached.get("type") == "chunked":
+                        parts = []
+                        for c in cached.get("chunks", []):
+                            parts.append(c.get("content", ""))
+                        cached_text = "\n\n".join(parts)
+
                 previous_actions.append({
                     "iteration": iteration,
                     "reasoner_plan": reasoner_plan,
                     "action": action,
                     "result": {
                         "tool": "read_file",
-                        "error": (
-                            "File is already cached. Do not read it again. "
-                            "Use the cached file contents in the Reasoner context."
-                        ),
+                        "result": cached_text,
                     },
                 })
 
@@ -177,6 +212,19 @@ class Agent:
 
             if repeated_action_count >= MAX_REPEATED_ACTIONS:
                 print("[Agent] Same action repeated too many times without progress; stopping.")
+                stop_reason = "repeated_action"
+                break
+
+            # NEW: detect A-B-A-B style oscillation, not just immediate repeats
+            action_window.append(action_key)
+            window = list(action_window)
+            cycle_detected = False
+            for period in (1, 2, 3):
+                if len(window) >= period * 2 and window[-period:] == window[-2 * period:-period]:
+                    cycle_detected = True
+                    break
+            if cycle_detected:
+                print("[Agent] Detected oscillating action cycle; stopping.")
                 stop_reason = "repeated_action"
                 break
 
@@ -214,6 +262,7 @@ class Agent:
 
             # 8. Check test results
             if action.get("tool") == "run_tests":
+                last_test_iteration = iteration 
                 test_passed = result.get("returncode") == 0
                 current_state["last_test_result"] = {
                     "returncode": result.get("returncode"),
@@ -271,7 +320,8 @@ def _update_file_cache(
 ) -> None:
     """Update cached file contents based on a successfully executed action.
 
-    Successful read_file actions populate the cache.
+    Successful read_file actions populate the cache, optionally storing only
+    the requested line range so the Reasoner can read long files incrementally.
     File-modifying actions invalidate the corresponding cached entry so the
     Reasoner cannot make decisions using stale file contents.
     """
@@ -288,9 +338,8 @@ def _update_file_cache(
     if tool == "read_file":
         if "error" not in result:
             content = result.get("result", "")
-
             if isinstance(content, str):
-                file_cache[path] = content
+                file_cache[path] = _merge_cache_entry(file_cache.get(path), content, parameters)
 
         return
 
@@ -301,11 +350,49 @@ def _update_file_cache(
     }:
         file_cache.pop(path, None)
 
+
+def _merge_cache_entry(existing_entry: object, content: str, parameters: dict) -> dict:
+    """Merge a newly read chunk into the file cache entry for a path."""
+    if not isinstance(content, str):
+        return existing_entry if isinstance(existing_entry, dict) else {}
+
+    start_line = parameters.get("start_line")
+    end_line = parameters.get("end_line")
+
+    # A full-file read replaces any prior partial context for that path.
+    if start_line in (None, "") and end_line in (None, ""):
+        return {"type": "full", "content": content}
+
+    if isinstance(existing_entry, str):
+        existing_entry = {"type": "full", "content": existing_entry}
+
+    if not isinstance(existing_entry, dict):
+        existing_entry = {"type": "chunked", "chunks": []}
+
+    if existing_entry.get("type") == "full":
+        return existing_entry
+
+    chunk = {
+        "start_line": start_line,
+        "end_line": end_line,
+        "content": content,
+    }
+    chunks = existing_entry.get("chunks", [])
+
+    if not any(
+        c.get("start_line") == chunk["start_line"] and c.get("end_line") == chunk["end_line"]
+        for c in chunks
+    ):
+        chunks.append(chunk)
+
+    return {"type": "chunked", "chunks": chunks}
+
+
 def _is_cached_read(
     current_state: dict,
     action: dict,
 ) -> bool:
-    """Return True if read_file targets a file already in the cache."""
+    """Return True if read_file requests content that is already cached."""
     if action.get("tool") != "read_file":
         return False
 
@@ -316,5 +403,27 @@ def _is_cached_read(
         return False
 
     file_cache = current_state.get("file_cache", {})
+    entry = file_cache.get(path)
 
-    return path in file_cache
+    if not entry:
+        return False
+
+    if isinstance(entry, str):
+        return True
+
+    if not isinstance(entry, dict):
+        return False
+
+    if entry.get("type") == "full":
+        return True
+
+    start_line = parameters.get("start_line")
+    end_line = parameters.get("end_line")
+    if start_line in (None, "") and end_line in (None, ""):
+        return True
+
+    for chunk in entry.get("chunks", []):
+        if chunk.get("start_line") == start_line and chunk.get("end_line") == end_line:
+            return True
+
+    return False

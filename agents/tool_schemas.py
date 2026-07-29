@@ -16,8 +16,8 @@ from typing import Any
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "read_file": {
         "required": ["path"],
-        "optional": [],
-        "description": "Read the full contents of a file at `path` (relative to the workspace).",
+        "optional": ["start_line", "end_line"],
+        "description": "Read `path`. Optionally restrict to a 1-indexed line range via start_line/end_line for large files.",
     },
     "write_to_file": {
         "required": ["path", "content"],

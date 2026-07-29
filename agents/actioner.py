@@ -99,8 +99,16 @@ class Actioner:
         try:
             if tool_name == "read_file":
                 path = self._resolve_path(params.get("path", ""))
-                with open(path, 'r') as f:
-                    content = f.read()
+                with open(path, "r") as f:
+                    lines = f.readlines()
+                start = params.get("start_line")
+                end = params.get("end_line")
+                if start or end:
+                    s = max((start or 1) - 1, 0)
+                    e = end or len(lines)
+                    content = "".join(lines[s:e])
+                else:
+                    content = "".join(lines)
                 return {"tool": tool_name, "result": content}
 
             elif tool_name == "write_to_file":
@@ -249,6 +257,20 @@ class Actioner:
         next_action = reasoner_plan.get("next_action", "")
         reasoner_params = reasoner_plan.get("parameters", {}) or {}
 
+        # Fast path: the Reasoner already gave us a valid, schema-shaped action.
+        # Don't waste a token-capped LLM call re-typing a full file body back out.
+        direct_candidate = {"tool": next_action, "parameters": reasoner_params}
+        is_valid, _ = validate_action(direct_candidate)
+        if is_valid:
+            print(f"[Actioner] Passthrough (no LLM call needed): {next_action}")
+            return direct_candidate
+
+        # Slow path: genuine translation needed. Strip any large string values
+        # out before they ever enter the prompt/generation budget, and splice
+        # them back in afterward -- the Actioner model only ever has to move a
+        # placeholder token around, never regenerate file content.
+        safe_params, placeholders = _extract_large_values(reasoner_params)
+
         prompt = f"""You are an action executor operating inside a single, fixed workspace.
 
 You are operating in this workspace:
@@ -302,7 +324,7 @@ Do not put the tool parameters at the top level.
                 [{"role": "user", "content": prompt}],
                 temperature=0.1,
                 json_mode=True,
-                num_predict=512,
+                num_predict=768,
                 num_ctx=self.num_ctx,
                 keep_alive=0,
                 think=False,
@@ -361,6 +383,10 @@ Do not put the tool parameters at the top level.
             if folded:
                 action = {"tool": tool, "parameters": folded}
 
+        # Swap placeholder tokens back for the real (large) values the model
+        # never actually had to see or regenerate.
+        action = _restore_large_values(action, placeholders)
+
         is_valid, error = validate_action(action)
         if not is_valid:
             print(f"[Actioner] Rejected invalid action from model: {error}")
@@ -371,3 +397,25 @@ Do not put the tool parameters at the top level.
         print(f"[Actioner] Chose: {action}")
 
         return action
+
+
+def _extract_large_values(params: dict, threshold: int = 200) -> tuple[dict, dict]:
+    safe, placeholders = {}, {}
+    for i, (k, v) in enumerate(params.items()):
+        if isinstance(v, str) and len(v) > threshold:
+            key = f"__PLACEHOLDER_{i}__"
+            placeholders[key] = v
+            safe[k] = key
+        else:
+            safe[k] = v
+    return safe, placeholders
+
+def _restore_large_values(action: dict, placeholders: dict) -> dict:
+    if not placeholders or not isinstance(action, dict):
+        return action
+    params = action.get("parameters", {}) or {}
+    for k, v in params.items():
+        if isinstance(v, str) and v in placeholders:
+            params[k] = placeholders[v]
+    action["parameters"] = params
+    return action

@@ -84,7 +84,8 @@ Provide your analysis as a structured JSON response with these fields:
         task: str,
         current_state: dict[str, Any],
         previous_actions: list[dict],
-        avoid_action: tuple[str, str] | None = None,  # (tool, json_stringified_params)
+        avoid_action: tuple[str, str] | None = None,
+        stagnation_hint: str | None = None,   
     ) -> dict[str, Any] | None:
         """Generate the next single action to take.
 
@@ -126,8 +127,11 @@ You MUST pick a genuinely different tool call (or "done"). Re-reading a
 file you already have the full contents of is NOT allowed.
 """
 
+        stagnation_block = f"\n{stagnation_hint}\n" if stagnation_hint else "" 
+
         prompt = f"""You are the reasoning component of a software engineering agent.
 {avoid_block}
+{stagnation_block}
 Your job is to select exactly ONE next action. You do NOT execute tools
 yourself -- a separate component (the Actioner) will translate your choice
 into a concrete tool call.
@@ -156,6 +160,11 @@ Guidance:
 - Use search_code with concrete identifiers extracted from the task
   (function/class names, file names, error messages) -- never paste the
   entire task description as a search query.
+- For long files, prefer read_file with start_line/end_line to read a
+  specific slice instead of trying to dump the whole file at once.
+- If a file is already partially cached, you can request a different
+  line range for that same path to add more context; the loop will merge
+  it into the cached file description.
 - Only choose write_to_file when a brand new file is genuinely required;
   prefer replace_in_file for editing existing files.
 - Never invent a project, path, or workspace unrelated to this task.
@@ -379,7 +388,7 @@ def _format_file_cache(
 
     The Reasoner gets actual file contents instead of only a list of paths.
     Individual files and the total cache are capped to avoid exhausting the
-    model's context window.
+    model's context window. Partial reads are rendered as line-range chunks.
     """
     if not file_cache:
         return "(no files cached yet)"
@@ -387,16 +396,39 @@ def _format_file_cache(
     sections = []
     total_chars = 0
 
-    for path, content in file_cache.items():
-        content = str(content)
+    for path, entry in file_cache.items():
+        if isinstance(entry, str):
+            content_text = entry
+            header = "FILE: {}\n".format(path)
+        elif isinstance(entry, dict) and entry.get("type") == "full":
+            content_text = str(entry.get("content", ""))
+            header = "FILE: {}\n".format(path)
+        elif isinstance(entry, dict) and entry.get("type") == "chunked":
+            chunks = entry.get("chunks", [])
+            rendered_chunks = []
+            for chunk in chunks:
+                start = chunk.get("start_line")
+                end = chunk.get("end_line")
+                if start is not None or end is not None:
+                    prefix = f"[lines {start or 1}-{end or '?'}]"
+                else:
+                    prefix = "[chunk]"
+                rendered_chunks.append(
+                    f"{prefix}\n{chunk.get('content', '')}"
+                )
+            content_text = "\n\n".join(rendered_chunks)
+            header = "FILE: {} (partial chunks)\n".format(path)
+        else:
+            content_text = str(entry)
+            header = "FILE: {}\n".format(path)
 
-        if len(content) > max_file_chars:
-            content = (
-                content[:max_file_chars]
+        if len(content_text) > max_file_chars:
+            content_text = (
+                content_text[:max_file_chars]
                 + "\n... [file content truncated for prompt]"
             )
 
-        section = "FILE: {}\n{}\n".format(path, content)
+        section = "{}{}\n".format(header, content_text)
 
         if total_chars + len(section) > max_total_chars:
             remaining = max_total_chars - total_chars
