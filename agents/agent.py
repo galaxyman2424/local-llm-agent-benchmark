@@ -53,6 +53,7 @@ class AgentResult:
     test_passed: bool | None = None
     final_patch: str = ""
     status: str = "incomplete"  # passed, failed, incomplete, timeout, error
+    exit_reason: str = ""  # one of STOP_REASONS
 
     # NEW: diagnostic fields showing where the agent left off
     stop_reason: str = ""            # see STOP_REASONS below
@@ -70,11 +71,11 @@ class Agent:
     the reasoner as part of previous_actions. Repeats until tests pass,
     the reasoner signals completion, or max_iterations is reached.
     """
-
-    def __init__(self, reasoner, actioner, max_iterations: int = 50):
+    def __init__(self, reasoner, actioner, max_iterations: int = 50, timeout: float | None = None):
         self.reasoner = reasoner
         self.actioner = actioner
         self.max_iterations = max_iterations
+        self.timeout = timeout
 
     def solve(self, repo_path: str, task: str, test_command: str = "pytest --tb=short") -> AgentResult:
         """Run the agent on a single SWE-bench-style task."""
@@ -111,12 +112,16 @@ class Agent:
         solve_start = time.time()
         timed_out = False
 
+        #recording exit reason
+        exit_reason = ""
+
         for iteration in range(self.max_iterations):
             num_iterations = iteration + 1
 
             if self.timeout is not None and (time.time() - solve_start) > self.timeout:
                 print(f"[Agent] Overall timeout ({self.timeout}s) exceeded; stopping.")
                 timed_out = True
+                exit_reason = "timeout"
                 break
 
             # If the last executed action repeated at least once, tell the
@@ -150,12 +155,14 @@ class Agent:
             if not reasoner_plan:
                 print("[Agent] Reasoner failed to produce a plan.")
                 stop_reason = "reasoner_failed"
+                exit_reason = "reasoner_failed"
                 break
 
             # 2. Stop conditions from the Reasoner
             if reasoner_plan.get("next_action") in STOP_ACTIONS:
                 print(f"[Agent] Reasoner signaled '{reasoner_plan.get('next_action')}'; stopping.")
                 stop_reason = "reasoner_done"
+                exit_reason = "reasoner_done"
                 break
 
             # 3. Actioner translates plan into exactly one concrete tool call
@@ -173,6 +180,7 @@ class Agent:
                     action = fallback
                 else:
                     stop_reason = "actioner_failed"
+                    exit_reason = "actioner_failed"
                     break
 
             is_valid, error = validate_action(action)
@@ -225,6 +233,7 @@ class Agent:
             if repeated_action_count >= MAX_REPEATED_ACTIONS:
                 print("[Agent] Same action repeated too many times without progress; stopping.")
                 stop_reason = "repeated_action"
+                exit_reason = "repeated_action"
                 break
 
             # NEW: detect A-B-A-B style oscillation, not just immediate repeats
@@ -238,6 +247,7 @@ class Agent:
             if cycle_detected:
                 print("[Agent] Detected oscillating action cycle; stopping.")
                 stop_reason = "repeated_action"
+                exit_reason = "repeated_action"
                 break
 
             # 5. Execute the concrete tool call (deterministic)
@@ -284,6 +294,7 @@ class Agent:
                 if test_passed:
                     print("[Agent] Tests passed.")
                     stop_reason = "tests_passed"
+                    exit_reason = "tests_passed"
                     break
 
         # =========================================================
@@ -301,7 +312,7 @@ class Agent:
         # Determine final status (assigned exactly once, right before
         # constructing the result -- never referenced earlier).
         if test_passed is None:
-            status = "timeout" if (timed_out or num_iterations >= self.max_iterations) else "incomplete"
+            status = "timeout" if num_iterations >= self.max_iterations else "incomplete"
         elif test_passed:
             status = "passed"
         else:
@@ -310,22 +321,15 @@ class Agent:
         return AgentResult(
             instance_id="", repo_name="", base_commit="",
             num_iterations=num_iterations, total_tool_calls=total_tool_calls,
-            test_passed=test_passed, final_patch=final_patch, status=status,
+            test_passed=test_passed, final_patch=final_patch, status=status, exit_reason=exit_reason,
             stop_reason=stop_reason,
             last_reasoner_plan=last_reasoner_plan,
             last_action=last_action,
             last_result=last_result,
             history=previous_actions,
         )
-
-def _stable_repr(value) -> str:
-    import json as _json
-    try:
-        return _json.dumps(value, sort_keys=True)
-    except TypeError:
-        return repr(value)
-
-def _get_initial_file_listing(self, repo_path: str, max_files: int = 50) -> str:
+    
+    def _get_initial_file_listing(self, repo_path: str, max_files: int = 50) -> str:
         """Best-effort shallow listing of the repo so the Reasoner isn't
         guessing blind on its very first plan() call.
         """
@@ -347,6 +351,14 @@ def _get_initial_file_listing(self, repo_path: str, max_files: int = 50) -> str:
                 return "\n".join(sorted(os.listdir(repo_path))[:max_files])
             except Exception:
                 return "(directory listing unavailable)"
+
+def _stable_repr(value) -> str:
+    import json as _json
+    try:
+        return _json.dumps(value, sort_keys=True)
+    except TypeError:
+        return repr(value)
+
 
 def _update_file_cache(
     current_state: dict,
@@ -460,4 +472,3 @@ def _is_cached_read(
             return True
 
     return False
-

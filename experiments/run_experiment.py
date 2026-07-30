@@ -16,6 +16,37 @@ from pathlib import Path
 # otherwise raise ModuleNotFoundError.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+def _write_running_summary(
+    summary_path: Path,
+    config_path: str,
+    reasoner_model: str,
+    actioner_model: str,
+    results: list,
+    total_instances: int,
+    elapsed_seconds: float,
+) -> None:
+    """Write an in-progress summary after each instance, so a crash mid-run
+    still leaves a usable partial summary on disk instead of nothing."""
+    from benchmarks.swebench import InstanceRecord
+
+    resolved = sum(1 for r in results if isinstance(r, InstanceRecord) and r.status == "resolved")
+    errors = sum(1 for r in results if not isinstance(r, InstanceRecord))
+    completed = len(results)
+
+    partial_summary = {
+        "experiment_config": config_path,
+        "reasoner_model": reasoner_model,
+        "actioner_model": actioner_model,
+        "completed_instances": completed,
+        "total_instances": total_instances,
+        "resolved": resolved,
+        "resolve_rate": resolved / completed if completed else 0.0,
+        "errors": errors,
+        "elapsed_seconds": round(elapsed_seconds, 2),
+        "status": "in_progress",
+    }
+    with open(summary_path, "w") as f:
+        json.dump(partial_summary, f, indent=2)
 
 def load_config(config_path: str) -> dict:
     """Load and return the YAML config as a Python dict."""
@@ -166,6 +197,7 @@ def run_experiment(
         print(f"[Experiment] Running instance {i+1}/{len(selected_instances)}: {instance_id}")
         print(f"{'='*60}")
 
+        result = None
         try:
             # Get the repo path for this instance from benchmark
             task = dataset["instances"][instance_id]
@@ -196,8 +228,12 @@ def run_experiment(
                 "traceback": traceback.format_exc(),
             }
             results.append(error_result)
+            result = None
             print(f"[Experiment] Instance {instance_id}: ERROR - {e}")
-        benchmark.save_raw([result])
+            print(error_result["traceback"]) 
+
+        if result is not None:
+            benchmark.save_raw([result])
 
         results_processed_dir.mkdir(parents=True, exist_ok=True)
         summary_stem = run_name or Path(config_path).stem
@@ -225,18 +261,25 @@ def run_experiment(
 
     by_stop_reason: dict[str, int] = {}
     instance_digests = []
+    by_exit_reason: dict[str, int] = {}
     for r in results:
         if isinstance(r, InstanceRecord):
             if r.stop_reason:
                 by_stop_reason[r.stop_reason] = by_stop_reason.get(r.stop_reason, 0) + 1
+            if r.exit_reason:
+                by_exit_reason[r.exit_reason] = by_exit_reason.get(r.exit_reason, 0) + 1
             instance_digests.append({
                 "instance_id": r.instance_id,
                 "status": r.status,
                 "stop_reason": r.stop_reason,
+                "exit_reason": r.exit_reason,
                 "num_iterations": r.num_iterations,
                 "last_tool": (r.last_action or {}).get("tool"),
             })
     
+    timeouts = sum(1 for r in results if isinstance(r, InstanceRecord) and r.status == "timeout")
+    repeated_loops = by_exit_reason.get("repeated_action_loop", 0)
+
     summary = {
         "experiment_config": config_path,
         "reasoner_model": reasoner_model,
@@ -245,9 +288,11 @@ def run_experiment(
         "resolved": resolved,
         "resolve_rate": resolved / total if total else 0.0,
         "by_status": by_status,
+        "by_exit_reason": by_exit_reason,
+        "timeouts": timeouts,
+        "repeated_action_loops": repeated_loops,
         "errors": error_count,
         "run_time_seconds": round(run_time, 2),
-        "by_stop_reason": by_stop_reason,
         "instances": instance_digests,
     }
 

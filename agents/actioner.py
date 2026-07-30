@@ -192,10 +192,10 @@ class Actioner:
                 try:
                     result = subprocess.run(
                         command, shell=True, capture_output=True, text=True,
-                        cwd=self.workspace_dir, timeout=300,
+                        cwd=self.workspace_dir, timeout=120,
                     )
-                except subprocess.TimeoutExpired as e:
-                    return {"tool": tool_name, "error": f"Command timed out after 120s: {e}", "returncode": None}
+                except subprocess.TimeoutExpired:
+                    return {"tool": tool_name, "error": "run_command timed out after 120s", "returncode": None}
                 return {"tool": tool_name, "result": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
 
             elif tool_name == "run_tests":
@@ -206,8 +206,8 @@ class Actioner:
                         test_command, shell=True, capture_output=True, text=True,
                         cwd=self.workspace_dir, timeout=300,
                     )
-                except subprocess.TimeoutExpired as e:
-                    return {"tool": tool_name, "error": f"Tests timed out after 120s: {e}", "returncode": None}
+                except subprocess.TimeoutExpired:
+                    return {"tool": tool_name, "error": "run_tests timed out after 300s", "returncode": None}
                 return {"tool": tool_name, "result": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
 
             elif tool_name == "get_git_diff":
@@ -245,7 +245,7 @@ class Actioner:
 
         git_grep_cmd = ["git", "grep", "-n", "-I", "--untracked", query, "--", subpath or "."]
         result = subprocess.run(
-            git_grep_cmd, capture_output=True, text=True, cwd=self.workspace_dir,
+            git_grep_cmd, capture_output=True, text=True, cwd=self.workspace_dir, timeout=30,
         )
         if result.returncode in (0, 1):  # 0 = matches found, 1 = no matches (still a valid run)
             matches = [line.strip() for line in result.stdout.split("\n") if line.strip()]
@@ -256,7 +256,7 @@ class Actioner:
         for d in exclude_dirs:
             exclude_args += ["--exclude-dir=" + d]
         grep_cmd = ["grep", "-r", "-n", *exclude_args, query, search_root]
-        result = subprocess.run(grep_cmd, capture_output=True, text=True)
+        result = subprocess.run(grep_cmd, capture_output=True, text=True, timeout=30)
         matches = [line.strip() for line in result.stdout.split("\n") if line.strip()]
         return {"tool": "search_code", "result": matches}
 
@@ -280,19 +280,18 @@ class Actioner:
         workspace-relative path) without inventing new goals.
         """
         next_action = reasoner_plan.get("next_action", "")
-        reasoner_params = reasoner_plan.get("parameters", {}) or {}
-        
-        next_action = result.get("next_action", result.get("action", "search_code"))
-        if next_action == "done" and not _tests_passed(previous_actions):
-            print("[Reasoner.plan] Model chose 'done' without a passing run_tests in "
-                  "history; overriding to 'run_tests' instead.")
-            next_action = "run_tests"
 
-        return {
-            "next_action": next_action,
-            "parameters": result.get("parameters", result.get("params", {})),
-            "expected_outcome": result.get("expected_outcome", result.get("outcome", "")),
-        }
+        # write_to_file params are stripped of large string values before
+        # they ever enter the prompt (see _extract_large_values below), so
+        # in the common case this call never has to regenerate file
+        # content and 512 tokens is plenty. This bump is a safety net for
+        # cases that don't go through the placeholder path (e.g. content
+        # under the extraction threshold, or a schema mismatch that forces
+        # the model to retype something) rather than the primary defense
+        # against truncation.
+        num_predict = 4096 if next_action == "write_to_file" else 512
+
+        reasoner_params = reasoner_plan.get("parameters", {}) or {}
 
         # Fast path: the Reasoner already gave us a valid, schema-shaped action.
         # Don't waste a token-capped LLM call re-typing a full file body back out.
@@ -329,7 +328,7 @@ REASONER'S CHOSEN NEXT ACTION:
 {next_action}
 
 REASONER'S SUGGESTED PARAMETERS:
-{json.dumps(reasoner_params)}
+{json.dumps(safe_params)}
 
 Available tools and their required/optional parameters:
 {schema_prompt_block()}
@@ -375,7 +374,7 @@ Do not put the tool parameters at the top level.
 
         if not text.strip():
             print("[Actioner] Ollama returned empty content.")
-            print(f"[Actioner] Done reason: {response.get('done_reason', 'unknown')}")
+            #print(f"[Actioner] Done reason: {response.get('done_reason', 'unknown')}")
             return None
 
         candidate = extract_json_object(text)
@@ -399,7 +398,7 @@ Do not put the tool parameters at the top level.
                 print(f"[Actioner] done_reason={response.get('done_reason', '?')} "
                       f"prompt_eval_count={response.get('prompt_eval_count', '?')} "
                       f"eval_count={response.get('eval_count', '?')} num_ctx={self.num_ctx}")
-                print(f"[Actioner] Raw model response: {text[:2000]!r}")
+                #print(f"[Actioner] Raw model response: {text[:2000]!r}")
                 return None
         else:
             try:
@@ -436,7 +435,7 @@ Do not put the tool parameters at the top level.
         return action
 
 
-def _extract_large_values(params: dict, threshold: int = 200) -> tuple[dict, dict]:
+def _extract_large_values(params: dict, threshold: int = 80) -> tuple[dict, dict]:
     safe, placeholders = {}, {}
     for i, (k, v) in enumerate(params.items()):
         if isinstance(v, str) and len(v) > threshold:

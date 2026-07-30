@@ -38,6 +38,7 @@ class InstanceRecord:
     last_action: dict = field(default_factory=dict)
     last_result: dict = field(default_factory=dict)
     history: list = field(default_factory=list)
+    exit_reason: str = "" 
 
 
 class SWEbenchBenchmark:
@@ -134,16 +135,13 @@ class SWEbenchBenchmark:
         test_cmd = task.get("test_command", "pytest")
         agent_result = agent.solve(str(repo_path), task_text, test_command=test_cmd)
 
-        record.stop_reason = getattr(agent_result, "stop_reason", "") if agent_result else ""
-        record.last_reasoner_plan = getattr(agent_result, "last_reasoner_plan", None) or {}
-        record.last_action = getattr(agent_result, "last_action", None) or {}
-        record.last_result = getattr(agent_result, "last_result", None) or {}
-        record.history = getattr(agent_result, "history", None) or []
-
-        record.num_iterations = agent_result.num_iterations if agent_result else 0
-        record.total_tool_calls = agent_result.total_tool_calls if agent_result else 0
-        record.final_patch = agent_result.final_patch if agent_result else ""
-
+        record.exit_reason = getattr(agent_result, "exit_reason", "") or ""
+        record.stop_reason = getattr(agent_result, "stop_reason", "") or ""
+        record.last_action = getattr(agent_result, "last_action", {}) or {}
+        record.last_result = getattr(agent_result, "last_result", {}) or {}
+        record.last_reasoner_plan = getattr(agent_result, "last_reasoner_plan", {}) or {}
+        record.history = getattr(agent_result, "history", []) or []
+        
         if not install_ok:
             # Environment setup genuinely failed -- running tests would
             # just fail for everything regardless of the agent, wasting a

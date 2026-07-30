@@ -262,10 +262,10 @@ Return only the JSON object, nothing else."""
             print("[Reasoner] Ollama returned an empty content response.")
             print("[Reasoner] Done reason: {}".format(response.get("done_reason", "unknown")))
             print("[Reasoner] Thinking length: {}".format(len(message.get("thinking", "") or "")))
-            print("[Reasoner] prompt_eval_count={} eval_count={} (if eval_count is near num_predict "
-                  "or prompt_eval_count+eval_count is near num_ctx={}, the context window is too "
-                  "small for this prompt).".format(
-                      response.get("prompt_eval_count", "?"), response.get("eval_count", "?"), self.num_ctx))
+            #print("[Reasoner] prompt_eval_count={} eval_count={} (if eval_count is near num_predict "
+                  #"or prompt_eval_count+eval_count is near num_ctx={}, the context window is too "
+                  #"small for this prompt).".format(
+                      #response.get("prompt_eval_count", "?"), response.get("eval_count", "?"), self.num_ctx))
             return None
 
         candidate = extract_json_object(text)
@@ -292,7 +292,7 @@ Return only the JSON object, nothing else."""
                   f"prompt_eval_count={response.get('prompt_eval_count', '?')} "
                   f"eval_count={response.get('eval_count', '?')} num_ctx={self.num_ctx}")
             print("[Reasoner] Raw model response:")
-            print(repr(text[:2000]))
+            #print(repr(text[:2000]))
             return None
         try:
             return _json.loads(candidate)
