@@ -206,3 +206,63 @@ git clone <swe-bench-lite-url> seed_repos/swe_bench_lite/
 ## License
 
 This project is for research purposes. See individual files for specific licensing terms where applicable.
+
+
+Don't guess blind — use the logging that's already there. reasoner.py already prints prompt_eval_count and eval_count on every call (lines ~254-257, ~271-282). Run one task with these new values and watch those numbers to confirm you're nowhere near num_ctx before committing to a benchmark run.
+The actioner's prompt is tiny by comparison (just the schema block + the reasoner's chosen action — large values get stripped via _extract_large_values before it even sees them), so ornith:9b's 128k window is mostly headroom there; no analogous constant to raise.
+Watch VRAM. Both models loaded simultaneously with KV cache sized for 128k each (vs. today's 16k) is a real jump — keep ollama ps / nvidia-smi open on your first run in case you need to scale back.
+
+
+1. Find out where it's actually failing (do this first)
+
+Right now nothing aggregates why a run didn't resolve — just pass/fail. Add a quick counter across a batch of previous_actions records (or grep your logs) for:
+
+"Rejected invalid action" (Actioner produced schema-invalid JSON)
+"SEARCH/REPLACE failed. Text not found" (from agents/actioner.py's execute)
+"Reasoner reply contained no JSON object" / repaired-JSON events
+Reasoner saying "done" before any run_tests action ever happened
+
+My strong guess, given this architecture (small local models, JSON-mode, two-model handoff): replace_in_file's exact-substring match is your biggest silent killer. A 7-9B model asked to reproduce an exact multi-line search string (correct whitespace, correct indentation, matching the actual file content it may have only seen truncated) will very often be a few characters off, and content.replace(search_text, replace_text) in actioner.py fails with zero partial credit — the whole edit is silently discarded and the loop burns an iteration.
+
+2. Make editing more forgiving (highest leverage fix)
+
+Two options, in order of effort:
+
+Cheap: normalize whitespace before comparing — strip trailing whitespace per line, or do a fuzzy/near-match fallback (e.g. try matching ignoring leading indentation, then re-indent the replacement) before giving up.
+
+Better: have the Actioner emit the search text as line-anchored (e.g. "replace lines containing X through Y") rather than an exact block, or switch to unified-diff application (git apply) for edits instead of raw substring replace — diffs tolerate context better and you already have apply_patch in swebench/utils.py you could reuse for this instead of only using it for test_patch.
+
+Better option (diff-based) — same call site, but instead of string .replace(), build a unified diff from search_text/replace_text and call the existing apply_patch from swebench/utils.py:
+
+python
+elif tool_name in ("replace_in_file", "edit_file"):
+    path = self._resolve_path(params.get("path", ""))
+    from swebench.utils import apply_patch
+    import difflib
+    with open(path, 'r') as f:
+        content = f.read()
+    search_text = params.get("search", "")
+    replace_text = params.get("replace", "")
+    ...
+    # build a diff between content-with-search and content-with-replace,
+    # then apply_patch(self.workspace_dir, diff_text) with git apply's
+    # fuzzier context matching instead of exact substring replace
+
+This is more invasive (you'd restructure the whole branch), so I'd start with the cheap fuzzy fallback above and only move to diff-based if that's still not tolerant enough.
+
+
+3. Give the Reasoner a starting foothold instead of total blindness
+
+Right now Reasoner.plan's first call has previous_actions = [] and current_state with no file tree, no README, nothing — it's guessing what to search_code for based purely on the issue text. For real repos (django, astropy, sympy) that's a lot of wasted iterations just orienting. Consider seeding current_state in Agent.solve with a shallow list_directory result or git ls-files | head -50 before the loop starts, so iteration 1 isn't spent discovering the repo has a src/ layout.
+
+4. Check iteration budget vs. actual task complexity
+
+configs/single_model.yaml and qwen_deepseek.yaml set max_iterations: 10 — that's search → read → edit → run_tests → (probably fail once) → re-read → re-edit → run_tests, which is tight for a 9B model that isn't going to nail it in one edit. qwen_ornith.yaml gives 50, which is more realistic. If your low-iteration configs are the ones you're checking pass rates on, bump them — 10 is likely starving the agent, not testing the model fairly.
+
+5. Watch for premature "done"
+
+STOP_ACTIONS = ("done", "submit_solution") lets the Reasoner bail without ever running tests. If your failure logs show "done" frequently with no preceding run_tests in that instance's history, the Reasoner is hallucinating completion. Fix: in the Reasoner's prompt, explicitly disallow choosing "done" unless run_tests appears with returncode == 0 somewhere in previous_actions — that's a prompt-level guard you can add in reasoner.py's plan() prompt text, no architecture change needed.
+
+6. num_predict=512 in the Actioner may be truncating write_to_file
+
+agents/actioner.py's plan_action hardcodes num_predict=512 for every action, including write_to_file with a full new file's content. If any instance needs a new file longer than ~512 tokens, that call will truncate mid-content (the repair-JSON fallback will "succeed" but hand back a broken/incomplete file). Consider scaling num_predict up specifically when reasoner_plan.get("next_action") == "write_to_file".

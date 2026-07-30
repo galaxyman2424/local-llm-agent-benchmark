@@ -23,6 +23,24 @@ def load_config(config_path: str) -> dict:
         import yaml
         return yaml.safe_load(f)
 
+def get_model_max_context(model_id: str, base_url: str = "http://localhost:11434") -> int | None:
+    """Query Ollama for a model's native max context length."""
+    import urllib.request, json
+    req = urllib.request.Request(
+        f"{base_url}/api/show",
+        data=json.dumps({"model": model_id}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        info = json.loads(resp.read())
+    # context length shows up under model_info, key varies by architecture
+    # e.g. "qwen2.context_length", "llama.context_length"
+    model_info = info.get("model_info", {})
+    for key, value in model_info.items():
+        if key.endswith(".context_length"):
+            return int(value)
+    return None       
+
 
 def run_experiment(
     *,
@@ -103,11 +121,12 @@ def run_experiment(
     # 120s single-request timeout, or vice versa.
     reasoner_timeout = config.get("reasoner", {}).get("timeout_seconds", 120.0)
     actioner_timeout = config.get("actioner", {}).get("timeout_seconds", 120.0)
+
     # num_ctx (context window) is a SEPARATE knob from num_predict -- see
     # agents/reasoner.py's DEFAULT_NUM_CTX docstring. Too small a value here
     # is the actual cause of replies truncating mid-JSON, not num_predict.
-    reasoner_num_ctx = config.get("reasoner", {}).get("num_ctx", 16384)
-    actioner_num_ctx = config.get("actioner", {}).get("num_ctx", 16384)
+    reasoner_num_ctx = config.get("reasoner", {}).get("num_ctx") or get_model_max_context(reasoner_model) or 16384
+    actioner_num_ctx = config.get("actioner", {}).get("num_ctx") or get_model_max_context(actioner_model) or 16384
 
     print(f"[Experiment] Initializing Reasoner (model={reasoner_model}, request_timeout={reasoner_timeout}s, "
           f"num_ctx={reasoner_num_ctx})...")
@@ -118,8 +137,10 @@ def run_experiment(
     actioner = Actioner(model_id=actioner_model, timeout_seconds=actioner_timeout, num_ctx=actioner_num_ctx)
 
     agent_max_iter = config.get("agent", {}).get("max_iterations", 50)
+    agent_timeout = config.get("agent", {}).get("timeout_seconds", None)
     print(f"[Experiment] Agent max iterations: {agent_max_iter}")
-    agent = Agent(reasoner, actioner, max_iterations=agent_max_iter)
+    print(f"[Experiment] Agent timeout: {agent_timeout}s")
+    agent = Agent(reasoner, actioner, max_iterations=agent_max_iter, timeout=agent_timeout)
 
     # Get benchmark object
     from benchmarks import SWEbenchBenchmark
@@ -176,6 +197,14 @@ def run_experiment(
             }
             results.append(error_result)
             print(f"[Experiment] Instance {instance_id}: ERROR - {e}")
+        benchmark.save_raw([result])
+
+        results_processed_dir.mkdir(parents=True, exist_ok=True)
+        summary_stem = run_name or Path(config_path).stem
+        summary_path = results_processed_dir / f"{summary_stem}.json"
+        _write_running_summary(summary_path, config_path, reasoner_model,
+                                actioner_model, results, len(selected_instances),
+                                time.time() - start_time)
 
     # Save raw results using benchmark's save_raw
     run_time = time.time() - start_time

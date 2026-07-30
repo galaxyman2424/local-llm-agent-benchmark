@@ -54,6 +54,29 @@ class Actioner:
         )
         self._history = []
 
+    def _fuzzy_replace(self, content: str, search_text: str, replace_text: str) -> str | None:
+        """Try to match `search_text` against `content` ignoring per-line
+        leading/trailing whitespace, and re-indent `replace_text` to match
+        what was actually found. Returns None if still no match.
+        """
+        content_lines = content.split("\n")
+        search_lines = search_text.split("\n")
+        if not search_lines:
+            return None
+
+        n = len(search_lines)
+        stripped_search = [l.strip() for l in search_lines]
+
+        for i in range(len(content_lines) - n + 1):
+            window = content_lines[i:i + n]
+            if [l.strip() for l in window] == stripped_search:
+                # Reuse the indentation of the first matched line
+                indent = window[0][:len(window[0]) - len(window[0].lstrip())]
+                replace_lines = [indent + l if l.strip() else l for l in replace_text.split("\n")]
+                new_lines = content_lines[:i] + replace_lines + content_lines[i + n:]
+                return "\n".join(new_lines)
+        return None
+
     def _resolve_path(self, path: str) -> str:
         """Resolve a file path against the current workspace.
 
@@ -131,6 +154,12 @@ class Actioner:
                         f.write(new_content)
                     return {"tool": tool_name, "result": "Replaced text successfully"}
                 else:
+                    # NEW: try again ignoring per-line leading/trailing whitespace
+                    fuzzy_result = self._fuzzy_replace(content, search_text, replace_text)
+                    if fuzzy_result is not None:
+                        with open(path, 'w') as f:
+                            f.write(fuzzy_result)
+                        return {"tool": tool_name, "result": "Replaced text successfully (fuzzy match)"}
                     return {"tool": tool_name, "error": f"SEARCH/REPLACE failed. Text not found in {path}"}
 
             elif tool_name == "delete_file":
@@ -160,30 +189,26 @@ class Actioner:
             elif tool_name == "run_command":
                 command = params.get("command", "")
                 import subprocess
-                result = subprocess.run(
-                    command, shell=True, capture_output=True, text=True,
-                    cwd=self.workspace_dir,
-                )
-                return {
-                    "tool": tool_name,
-                    "result": result.stdout,
-                    "stderr": result.stderr,
-                    "returncode": result.returncode
-                }
+                try:
+                    result = subprocess.run(
+                        command, shell=True, capture_output=True, text=True,
+                        cwd=self.workspace_dir, timeout=300,
+                    )
+                except subprocess.TimeoutExpired as e:
+                    return {"tool": tool_name, "error": f"Command timed out after 120s: {e}", "returncode": None}
+                return {"tool": tool_name, "result": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
 
             elif tool_name == "run_tests":
                 test_command = params.get("command", "pytest --tb=short")
                 import subprocess
-                result = subprocess.run(
-                    test_command, shell=True, capture_output=True, text=True,
-                    cwd=self.workspace_dir,
-                )
-                return {
-                    "tool": tool_name,
-                    "result": result.stdout,
-                    "stderr": result.stderr,
-                    "returncode": result.returncode
-                }
+                try:
+                    result = subprocess.run(
+                        test_command, shell=True, capture_output=True, text=True,
+                        cwd=self.workspace_dir, timeout=300,
+                    )
+                except subprocess.TimeoutExpired as e:
+                    return {"tool": tool_name, "error": f"Tests timed out after 120s: {e}", "returncode": None}
+                return {"tool": tool_name, "result": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
 
             elif tool_name == "get_git_diff":
                 diff_ref = params.get("diff", "")
@@ -256,6 +281,18 @@ class Actioner:
         """
         next_action = reasoner_plan.get("next_action", "")
         reasoner_params = reasoner_plan.get("parameters", {}) or {}
+        
+        next_action = result.get("next_action", result.get("action", "search_code"))
+        if next_action == "done" and not _tests_passed(previous_actions):
+            print("[Reasoner.plan] Model chose 'done' without a passing run_tests in "
+                  "history; overriding to 'run_tests' instead.")
+            next_action = "run_tests"
+
+        return {
+            "next_action": next_action,
+            "parameters": result.get("parameters", result.get("params", {})),
+            "expected_outcome": result.get("expected_outcome", result.get("outcome", "")),
+        }
 
         # Fast path: the Reasoner already gave us a valid, schema-shaped action.
         # Don't waste a token-capped LLM call re-typing a full file body back out.
@@ -324,7 +361,7 @@ Do not put the tool parameters at the top level.
                 [{"role": "user", "content": prompt}],
                 temperature=0.1,
                 json_mode=True,
-                num_predict=768,
+                num_predict=num_predict,
                 num_ctx=self.num_ctx,
                 keep_alive=0,
                 think=False,

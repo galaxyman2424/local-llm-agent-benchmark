@@ -44,7 +44,7 @@ def _slugify(model_id: str) -> str:
 def run_grid_search(
     *,
     models_path: str = "models.txt",
-    config_path: str = "configs/qwen_ornith.yaml",
+    config_path: str = "configs/qwn_ornith.yaml",
     limit: int | None = None,
     seed_repos_dir: str = "seed_repos/swe_bench_lite",
     results_raw_dir: str = "results/raw",

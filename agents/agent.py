@@ -89,6 +89,9 @@ class Agent:
             "file_cache": {}
         }
 
+        # blindness on iteration 1.
+        current_state["file_tree"] = self._get_initial_file_listing(repo_path)
+
         num_iterations = 0
         total_tool_calls = 0
         test_passed: bool | None = None
@@ -104,8 +107,17 @@ class Agent:
         action_window: deque = deque(maxlen=8)
         last_test_iteration = -999
 
+        import time
+        solve_start = time.time()
+        timed_out = False
+
         for iteration in range(self.max_iterations):
             num_iterations = iteration + 1
+
+            if self.timeout is not None and (time.time() - solve_start) > self.timeout:
+                print(f"[Agent] Overall timeout ({self.timeout}s) exceeded; stopping.")
+                timed_out = True
+                break
 
             # If the last executed action repeated at least once, tell the
             # Reasoner explicitly to avoid it -- don't wait for the
@@ -289,7 +301,7 @@ class Agent:
         # Determine final status (assigned exactly once, right before
         # constructing the result -- never referenced earlier).
         if test_passed is None:
-            status = "timeout" if num_iterations >= self.max_iterations else "incomplete"
+            status = "timeout" if (timed_out or num_iterations >= self.max_iterations) else "incomplete"
         elif test_passed:
             status = "passed"
         else:
@@ -312,6 +324,29 @@ def _stable_repr(value) -> str:
         return _json.dumps(value, sort_keys=True)
     except TypeError:
         return repr(value)
+
+def _get_initial_file_listing(self, repo_path: str, max_files: int = 50) -> str:
+        """Best-effort shallow listing of the repo so the Reasoner isn't
+        guessing blind on its very first plan() call.
+        """
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["git", "ls-files"],
+                cwd=repo_path, capture_output=True, text=True, timeout=10, check=False,
+            )
+            files = [f for f in result.stdout.splitlines() if f.strip()]
+            if not files:
+                raise RuntimeError("no git files")
+            return "\n".join(files[:max_files])
+        except Exception:
+            # Fall back to a plain os.listdir if it's not a git repo /
+            # git isn't available.
+            import os
+            try:
+                return "\n".join(sorted(os.listdir(repo_path))[:max_files])
+            except Exception:
+                return "(directory listing unavailable)"
 
 def _update_file_cache(
     current_state: dict,
@@ -350,7 +385,6 @@ def _update_file_cache(
     }:
         file_cache.pop(path, None)
 
-
 def _merge_cache_entry(existing_entry: object, content: str, parameters: dict) -> dict:
     """Merge a newly read chunk into the file cache entry for a path."""
     if not isinstance(content, str):
@@ -386,7 +420,6 @@ def _merge_cache_entry(existing_entry: object, content: str, parameters: dict) -
         chunks.append(chunk)
 
     return {"type": "chunked", "chunks": chunks}
-
 
 def _is_cached_read(
     current_state: dict,
@@ -427,3 +460,4 @@ def _is_cached_read(
             return True
 
     return False
+

@@ -20,7 +20,7 @@ from .json_utils import extract_json_object, repair_truncated_json
 # a large file read/test output doesn't blow the context window. Full,
 # untruncated output is still kept in `previous_actions`/benchmark logs --
 # only what gets fed back into the LLM prompt is capped here.
-MAX_OUTPUT_CHARS = 8000
+MAX_OUTPUT_CHARS = 32000
 
 # How many times the same (tool, parameters) pair can repeat in a row
 # before we inject explicit "you are stuck" feedback into the prompt.
@@ -31,7 +31,7 @@ REPEATED_ACTION_THRESHOLD = 2
 # the model then hits the context ceiling mid-generation and the reply
 # truncates well before num_predict would ever kick in. Set this generously
 # for every planning call.
-DEFAULT_NUM_CTX = 16384
+DEFAULT_NUM_CTX = 131072
 
 
 class Reasoner:
@@ -112,6 +112,17 @@ Provide your analysis as a structured JSON response with these fields:
             usable plan after a retry.
         """
         loop_warning = _loop_warning(previous_actions)
+        tests_confirmed_passing = _tests_passed(previous_actions)
+
+        done_rule = (
+            "You MAY choose \"done\" now, since a run_tests action with "
+            "returncode == 0 already appears in the previous actions above."
+            if tests_confirmed_passing else
+            "You MUST NOT choose \"done\" yet. No run_tests action with "
+            "returncode == 0 has occurred so far. If you believe the fix is "
+            "complete, your next_action MUST be \"run_tests\" to confirm it, "
+            "not \"done\"."
+        )
 
         file_cache = current_state.get("file_cache", {})
         file_cache_block = _format_file_cache(file_cache)
@@ -371,6 +382,20 @@ You MUST choose a different action or inspect a more specific file/query
 than before. Do not repeat the same tool call with the same parameters.
 """
 
+def _tests_passed(previous_actions: list[dict]) -> bool:
+    """True iff a run_tests action with returncode == 0 already appears in
+    previous_actions. Used to gate whether the Reasoner is allowed to
+    choose the 'done' meta-action -- otherwise it tends to hallucinate
+    completion (choosing 'done' with no run_tests behind it at all, or
+    after an edit but before ever confirming tests actually pass).
+    """
+    for record in previous_actions:
+        action = record.get("action", {})
+        result = record.get("result", {})
+        if action.get("tool") == "run_tests" and result.get("returncode") == 0:
+            return True
+    return False
+
 def _json_stable(value: Any) -> str:
     import json as _json
     try:
@@ -381,8 +406,8 @@ def _json_stable(value: Any) -> str:
 def _format_file_cache(
     file_cache: dict[str, str],
     *,
-    max_file_chars: int = 8000,
-    max_total_chars: int = 24000,
+    max_file_chars: int = 32000,
+    max_total_chars: int = 120000,
 ) -> str:
     """Render cached file contents for the Reasoner prompt.
 

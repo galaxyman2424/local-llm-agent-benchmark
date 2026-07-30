@@ -3,14 +3,13 @@ name: qwen_ornith
 reasoner:
   model: qwen3.5:9b
   timeout_seconds: 300  # max seconds for a single Ollama request
+  num_ctx: 131072 
 
 actioner:
   model: ornith:9b
   timeout_seconds: 300  # max seconds for a single Ollama request
+  num_ctx: 131072
 
 agent:
   max_iterations: 50
   timeout: 600  # max seconds for the WHOLE task (all iterations), not one LLM call
-
-benchmark:
-  name: swebench_lite
