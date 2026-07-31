@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# PreToolUse hook for this project.
+# Receives JSON on stdin describing the tool Cline is about to run, and must
+# print JSON back: {"cancel": bool, "errorMessage": "...", "contextModification": "..."}
+#
+# This does NOT govern the project's own Agent/Actioner loop (that's a
+# separate runtime, protected instead by agents/tool_schemas.py). This hook
+# only protects the repo while Cline itself is editing/running commands.
+
+input=$(cat)
+
+tool_name=$(echo "$input" | grep -o '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)"/\1/')
+command_str=$(echo "$input" | grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)"/\1/')
+file_path=$(echo "$input" | grep -oE '"(path|file_path)"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)"/\1/')
+
+# 1. Never let Cline hand-edit results/raw/ -- it's append-only experimental
+#    record per 03-project-conventions.md.
+if [[ "$file_path" == *"results/raw/"* ]]; then
+  echo '{"cancel": true, "errorMessage": "results/raw/ is append-only (never overwritten by design). If you need to fix a bad record, add a correction script instead of hand-editing the file."}'
+  exit 0
+fi
+
+# 2. Never let Cline hand-edit a cloned/checked-out SWE-bench repo -- those
+#    are disposable clones managed by setup_repo()/ensure_repo_environment,
+#    not project source.
+if [[ "$file_path" == *"seed_repos/"*"/repos/"* ]] || [[ "$file_path" == *"seed_repos/repos/"* ]]; then
+  echo '{"cancel": true, "errorMessage": "This path is inside a cloned/checked-out SWE-bench repo (seed_repos/.../repos/...). These are disposable and managed by setup_repo()/ensure_repo_environment -- edit project code instead, not the clone itself."}'
+  exit 0
+fi
+
+# 3. Warn (but do not block) on a full, unlimited benchmark run.
+if [[ "$command_str" == *"run_experiment.py"* ]] && [[ "$command_str" != *"--limit"* ]]; then
+  echo '{"cancel": true, "errorMessage": "This looks like a full, unlimited benchmark run (no --limit). Per ACTIONPLAN.md section 14, verify with --limit 1, then --limit 5/10 first. Re-run with --limit if you really mean to run everything, or ask the user to confirm an unlimited run explicitly."}'
+  exit 0
+fi
+
+if [[ "$command_str" == *"run_grid_search.py"* ]] && [[ "$command_str" != *"--dry-run"* ]] && [[ "$command_str" != *"--limit"* ]]; then
+  echo '{"cancel": true, "errorMessage": "Grid search without --dry-run or --limit will run every reasoner x actioner combination against the FULL dataset. Run --dry-run first (see the run-grid-search workflow)."}'
+  exit 0
+fi
+
+# 4. Block obviously destructive commands anywhere in the repo.
+if [[ "$command_str" =~ rm[[:space:]]+-rf[[:space:]]+(/|\.\.|seed_repos[^/]*$) ]]; then
+  echo '{"cancel": true, "errorMessage": "Blocked a broad recursive delete. Scope the rm -rf to a specific instance/workspace subdirectory instead."}'
+  exit 0
+fi
+
+# 5. Overnight code-improvement loop guardrails (see
+#    overnight-code-improvement-loop.md): never push, merge, or commit
+#    directly to main/master, regardless of what an unattended loop decides
+#    is a good idea at 3am.
+if [[ "$command_str" =~ git[[:space:]]+push ]] ; then
+  echo '{"cancel": true, "errorMessage": "Blocked: this project never auto-pushes. The overnight code-improvement loop leaves commits on a local branch for manual review -- push it yourself after reviewing."}'
+  exit 0
+fi
+
+if [[ "$command_str" =~ git[[:space:]]+(checkout|merge|rebase)[[:space:]]+.*(main|master) ]]; then
+  echo '{"cancel": true, "errorMessage": "Blocked: never switch to or merge into main/master during an autonomous loop. Stay on the overnight/<date> branch and let the user merge manually."}'
+  exit 0
+fi
+
+current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [[ "$command_str" =~ git[[:space:]]+commit ]] && [[ "$current_branch" == "main" || "$current_branch" == "master" ]]; then
+  echo '{"cancel": true, "errorMessage": "Blocked: current branch is main/master. Create an overnight/<date> branch before committing (see overnight-code-improvement-loop.md)."}'
+  exit 0
+fi
+
+echo '{"cancel": false}'

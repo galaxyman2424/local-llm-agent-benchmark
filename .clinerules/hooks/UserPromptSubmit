@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# UserPromptSubmit hook: lightweight context injection, no blocking.
+# Receives {"prompt": "...", ...} on stdin; returns
+# {"cancel": false, "contextModification": "..."}.
+
+input=$(cat)
+prompt=$(echo "$input" | grep -o '"prompt"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)"/\1/')
+
+context=""
+
+if echo "$prompt" | grep -qiE "reasoner|actioner|tool_schemas|agent loop|agent\.py"; then
+  context="WORKSPACE_RULES: Reasoner decides WHAT (never executes tools), Actioner.plan_action decides HOW (never calls an LLM in execute()), TOOL_SCHEMAS in agents/tool_schemas.py is the single source of truth for parameters. See .clinerules/01-architecture.md."
+fi
+
+if echo "$prompt" | grep -qiE "num_ctx|num_predict|truncat|empty content|ollama"; then
+  context="${context} WORKSPACE_RULES: JSON truncation from local models is usually a num_ctx (context window) problem, not num_predict -- see .clinerules/02-ollama-conventions.md before adding a new regex JSON extractor."
+fi
+
+if [[ -n "$context" ]]; then
+  echo "{\"cancel\": false, \"contextModification\": \"${context}\"}"
+else
+  echo '{"cancel": false}'
+fi
