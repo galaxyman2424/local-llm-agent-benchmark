@@ -133,6 +133,7 @@ class SWEbenchBenchmark:
 
         task_text = task.get("task_description") or task.get("problem_statement", "")
         test_cmd = task.get("test_command", "pytest")
+        
         agent_result = agent.solve(str(repo_path), task_text, test_command=test_cmd)
 
         record.exit_reason = getattr(agent_result, "exit_reason", "") or ""
@@ -141,6 +142,9 @@ class SWEbenchBenchmark:
         record.last_result = getattr(agent_result, "last_result", {}) or {}
         record.last_reasoner_plan = getattr(agent_result, "last_reasoner_plan", {}) or {}
         record.history = getattr(agent_result, "history", []) or []
+        record.num_iterations = getattr(agent_result, "num_iterations", 0) or 0
+        record.total_tool_calls = getattr(agent_result, "total_tool_calls", 0) or 0
+        record.final_patch = getattr(agent_result, "final_patch", "") or ""
         
         if not install_ok:
             # Environment setup genuinely failed -- running tests would

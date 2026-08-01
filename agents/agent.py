@@ -240,7 +240,7 @@ class Agent:
             action_window.append(action_key)
             window = list(action_window)
             cycle_detected = False
-            for period in (1, 2, 3):
+            for period in (2, 3):
                 if len(window) >= period * 2 and window[-period:] == window[-2 * period:-period]:
                     cycle_detected = True
                     break
