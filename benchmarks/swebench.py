@@ -134,7 +134,7 @@ class SWEbenchBenchmark:
         task_text = task.get("task_description") or task.get("problem_statement", "")
         test_cmd = task.get("test_command", "pytest")
         
-        agent_result = agent.solve(str(repo_path), task_text, test_command=test_cmd)
+        agent_result = agent.solve(str(repo_path), task_text, test_command=test_cmd, python_bin=python_bin)
 
         record.exit_reason = getattr(agent_result, "exit_reason", "") or ""
         record.stop_reason = getattr(agent_result, "stop_reason", "") or ""

@@ -85,7 +85,7 @@ Provide your analysis as a structured JSON response with these fields:
             "expected_outcome": "Repository should be in correct state with all changes applied.",
         }
 
-        result = self._call_model(prompt)
+        result = self._call_model(short_prompt, num_predict=1024, temperature=temperature)
         if isinstance(result, dict):
             analysis.update(result)
 
@@ -431,17 +431,18 @@ than before. Do not repeat the same tool call with the same parameters.
 """
 
 def _tests_passed(previous_actions: list[dict]) -> bool:
-    """True iff a run_tests action with returncode == 0 already appears in
-    previous_actions. Used to gate whether the Reasoner is allowed to
-    choose the 'done' meta-action -- otherwise it tends to hallucinate
-    completion (choosing 'done' with no run_tests behind it at all, or
-    after an edit but before ever confirming tests actually pass).
+    """Whether the MOST RECENT run_tests action passed -- not whether any
+    run_tests action ever passed at some earlier point. A later edit could
+    have broken something after an earlier passing run, so scanning for
+    "any pass in history" would wrongly let the Reasoner declare "done"
+    on a since-regressed fix.
     """
-    for record in previous_actions:
+    for record in reversed(previous_actions):
         action = record.get("action", {})
+        if action.get("tool") != "run_tests":
+            continue
         result = record.get("result", {})
-        if action.get("tool") == "run_tests" and result.get("returncode") == 0:
-            return True
+        return result.get("returncode") == 0
     return False
 
 def _json_stable(value: Any) -> str:

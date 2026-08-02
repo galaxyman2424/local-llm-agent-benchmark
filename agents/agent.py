@@ -77,11 +77,13 @@ class Agent:
         self.max_iterations = max_iterations
         self.timeout = timeout
 
-    def solve(self, repo_path: str, task: str, test_command: str = "pytest --tb=short") -> AgentResult:
+    def solve(self, repo_path, task, test_command="pytest --tb=short", python_bin: str | None = None) -> AgentResult:
         """Run the agent on a single SWE-bench-style task."""
         # Point the actioner at this task's repo so file/command tools
         # operate on the right workspace instead of the ambient cwd.
         self.actioner.workspace_dir = repo_path
+        if python_bin:
+            self.actioner.python_bin = python_bin
 
         previous_actions: list[dict] = []
         current_state: dict = {
@@ -99,6 +101,7 @@ class Agent:
         test_passed: bool | None = None
         repeated_action_count = 0
         last_action_key = None
+        last_action_tuple: tuple[str, str] | None = None
 
         stop_reason = "max_iterations"          # default if we exhaust the loop
         last_reasoner_plan: dict = {}
@@ -139,18 +142,19 @@ class Agent:
                 for r in previous_actions
             )
             stagnation_hint = None
-            if has_changes and (iteration - last_test_iteration) > 6:
+            if repeated_action_count >= 1:
                 stagnation_hint = (
-                    "You have made file changes but have not run tests in over "
-                    "6 iterations. Strongly consider choosing run_tests next."
+                    f"NOTE: your last action was repeated {repeated_action_count + 1} time(s) "
+                    "in a row without making progress. Try a genuinely different approach."
                 )
 
+            # 1. Reasoner decides what to do
             reasoner_plan = self.reasoner.plan(
                 task=task,
                 current_state=current_state,
                 previous_actions=previous_actions,
-                avoid_action=avoid_action,
-                stagnation_hint=stagnation_hint,   # NEW
+                avoid_action=last_action_tuple if repeated_action_count >= 1 else None,
+                stagnation_hint=stagnation_hint,
             )
 
             if not reasoner_plan:
@@ -260,6 +264,7 @@ class Agent:
             else:
                 repeated_action_count = 0
             last_action_key = action_key
+            last_action_tuple = action_key
 
             if repeated_action_count >= MAX_REPEATED_ACTIONS:
                 print("[Agent] Same action repeated too many times without progress; stopping.")
@@ -330,6 +335,7 @@ class Agent:
                         entry["lines"] = total_lines
                         entry["last_read_iteration"] = iteration + 1
                         entry["last_range_read"] = range_str
+                        entry.pop("stale_since_last_read", None)  # fresh read clears staleness
 
                     elif tool == "delete_file":
                         entry["deleted_at_iteration"] = iteration + 1
@@ -339,9 +345,6 @@ class Agent:
                         entry["last_modified_iteration"] = iteration + 1
                         entry["last_modified_tool"] = tool
                         entry.pop("deleted_at_iteration", None)
-                        # Any prior read is now stale -- exact line numbers/content may
-                        # have shifted (especially after replace_lines, which can change
-                        # the file's total line count).
                         entry["stale_since_last_read"] = "last_read_iteration" in entry
 
             current_state["last_plan"] = reasoner_plan

@@ -36,14 +36,8 @@ class Actioner:
     """
 
 class Actioner:
-    def __init__(
-        self,
-        model_id="ornith:9b",
-        workspace_dir=None,
-        timeout_seconds: float = 120.0,
-        num_ctx: int = DEFAULT_NUM_CTX,
-        max_read_lines: int = 300,
-    ):
+    def __init__(self, model_id="ornith:9b", workspace_dir=None, timeout_seconds=120.0,
+             num_ctx=DEFAULT_NUM_CTX, max_read_lines=300, python_bin: str | None = None):
         """``timeout_seconds`` is the max time for a single Ollama request
         (the Actioner's translate-plan-to-tool-call call), independent of
         the agent's overall per-task timeout configured elsewhere.
@@ -58,6 +52,7 @@ class Actioner:
         self.timeout_seconds = timeout_seconds
         self.num_ctx = num_ctx
         self.max_read_lines = max_read_lines
+        self.python_bin = python_bin
         self.client = OllamaClient(
             model=model_id,
             timeout_seconds=timeout_seconds,
@@ -305,7 +300,7 @@ class Actioner:
                 return self._search_code(params)
 
             elif tool_name == "run_command":
-                command = params.get("command", "")
+                command = self._use_venv_python(params.get("command", ""))
                 import subprocess
                 try:
                     result = subprocess.run(
@@ -317,7 +312,7 @@ class Actioner:
                 return {"tool": tool_name, "result": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
 
             elif tool_name == "run_tests":
-                test_command = params.get("command", "pytest --tb=short")
+                test_command = self._use_venv_python(params.get("command", "pytest --tb=short"))
                 import subprocess
                 try:
                     result = subprocess.run(
@@ -580,6 +575,16 @@ Do not put the tool parameters at the top level.
 
         return action
 
+def _use_venv_python(self, command: str) -> str:
+    """Rewrite bare `pytest`/`python(3)` invocations to use this workspace's
+    isolated venv interpreter, so mid-run test signal matches the venv the
+    benchmark actually evaluates against."""
+    import re
+    if self.python_bin in (None, "python"):
+        return command
+    command = re.sub(r'(?<![\w./])pytest\b', f'"{self.python_bin}" -m pytest', command)
+    command = re.sub(r'(?<![\w./])python3?\b', f'"{self.python_bin}"', command)
+    return command
 
 def _extract_large_values(params: dict, threshold: int = 80) -> tuple[dict, dict]:
     safe, placeholders = {}, {}
