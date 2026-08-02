@@ -46,22 +46,6 @@ DEFAULT_NUM_CTX = 131072
 RISKY_CONTENT_FIELDS = ("content", "search", "replace")
 
 
-def _repair_touches_risky_field(parsed: Any) -> bool:
-    """True if a (successfully re-parsed) repaired plan sets any of the
-    file-content fields in RISKY_CONTENT_FIELDS.
-
-    Used only on the repair path in ``Reasoner._call_model`` -- a plan that
-    parsed cleanly on the first try (no repair needed) is never subject to
-    this check, since there was nothing to silently truncate.
-    """
-    if not isinstance(parsed, dict):
-        return False
-    params = parsed.get("parameters")
-    if not isinstance(params, dict):
-        return False
-    return any(field in params for field in RISKY_CONTENT_FIELDS)
-
-
 class Reasoner:
     """Reasoning component that analyzes tasks and produces action plans."""
 
@@ -115,6 +99,7 @@ Provide your analysis as a structured JSON response with these fields:
         avoid_action: tuple[str, str] | None = None,
         stagnation_hint: str | None = None,   
     ) -> dict[str, Any] | None:
+
         """Generate the next single action to take.
 
         Parameters
@@ -153,7 +138,6 @@ Provide your analysis as a structured JSON response with these fields:
         )
 
         file_cache = current_state.get("file_cache", {})
-        file_cache_block = _format_file_cache(file_cache)
 
         avoid_block = ""
         if avoid_action is not None:
@@ -168,9 +152,17 @@ file you already have the full contents of is NOT allowed.
 
         stagnation_block = f"\n{stagnation_hint}\n" if stagnation_hint else "" 
 
+        files_read = current_state.get("files_read", {}) if isinstance(current_state, dict) else {}
+        state_for_prompt = (
+            {k: v for k, v in current_state.items() if k != "files_read"}
+            if isinstance(current_state, dict) else current_state
+        )
+
         prompt = f"""You are the reasoning component of a software engineering agent.
 {avoid_block}
 {stagnation_block}
+
+
 Your job is to select exactly ONE next action. You do NOT execute tools
 yourself -- a separate component (the Actioner) will translate your choice
 into a concrete tool call.
@@ -179,16 +171,15 @@ TASK:
 {task}
 
 CURRENT STATE:
-{_truncate(_state_without_file_cache(current_state))}
+{_truncate(state_for_prompt)}
 
-CACHED FILE CONTENTS:
-{file_cache_block}
+FILES ALREADY READ THIS TASK (do not re-read the same range again; use
+different start_line/end_line if you need a part you haven't seen):
+{_format_files_read(files_read)}
 
 RECENT PREVIOUS ACTIONS AND THEIR RESULTS (most recent last):
 {_truncate(_format_previous_actions(previous_actions))}
 {loop_warning}
-Available tools and their required/optional parameters:
-{schema_prompt_block()}
 
 You may also choose the special action "done" (with empty parameters) if
 you believe the task is already complete (e.g. the tests already pass and
@@ -205,6 +196,19 @@ Guidance:
 - Only choose write_to_file when a brand new file is genuinely required;
   prefer replace_in_file for editing existing files.
 - Never invent a project, path, or workspace unrelated to this task.
+- For files you expect to be large, or after a search_code hit gives you a
+  line number, use read_file's start_line/end_line to read just the
+  relevant section instead of the whole file.
+- When editing, prefer replace_lines over replace_in_file if you already
+  know the exact line numbers (e.g. from a recent read_file or
+  search_code call) -- it avoids needing to retype the original text
+  exactly. Include expected_line_count (end_line - start_line + 1) as a
+  safety check. Use replace_in_file instead only when you don't have
+  reliable line numbers but do have distinctive exact text to match.
+- Check the FILES ALREADY READ manifest before editing: if a file shows as
+  modified since your last read (or marked STALE), re-read the relevant
+  section first -- its line numbers or content may have shifted, especially
+  after a replace_lines edit that changed the file's total line count.
 Return ONLY a JSON object with exactly these fields:
 
 {{
@@ -286,7 +290,7 @@ Return only the JSON object, nothing else."""
         if not text.strip():
             print("[Reasoner] Ollama returned an empty content response.")
             print("[Reasoner] Done reason: {}".format(response.get("done_reason", "unknown")))
-            print("[Reasoner] Thinking length: {}".format(len(message.get("thinking", "") or "")))
+            #print("[Reasoner] Thinking length: {}".format(len(message.get("thinking", "") or "")))
             #print("[Reasoner] prompt_eval_count={} eval_count={} (if eval_count is near num_predict "
                   #"or prompt_eval_count+eval_count is near num_ctx={}, the context window is too "
                   #"small for this prompt).".format(
@@ -519,3 +523,52 @@ def _state_without_file_cache(current_state: dict[str, Any]) -> dict[str, Any]:
     state = dict(current_state)
     state.pop("file_cache", None)
     return state
+
+def _format_files_read(files_read: dict) -> str:
+    """Render the persistent per-file manifest -- small and NOT subject to
+    MAX_OUTPUT_CHARS truncation, so it stays visible every iteration even
+    once earlier read_file/edit results have aged out of previous_actions.
+    """
+    if not files_read:
+        return "(none yet)"
+    lines = []
+    for path, info in files_read.items():
+        if info.get("deleted_at_iteration"):
+            lines.append(f"- {path}: DELETED at iteration {info['deleted_at_iteration']}")
+            continue
+
+        parts = []
+        if "last_read_iteration" in info:
+            parts.append(
+                f"read at iteration {info['last_read_iteration']} "
+                f"(lines {info.get('last_range_read', '?')} of {info.get('lines', '?')} total)"
+            )
+        if "last_modified_iteration" in info:
+            parts.append(
+                f"MODIFIED at iteration {info['last_modified_iteration']} "
+                f"via {info.get('last_modified_tool', '?')}"
+            )
+        if info.get("stale_since_last_read"):
+            parts.append(
+                "** your earlier read is now STALE -- re-read before editing "
+                "again or relying on its line numbers/content **"
+            )
+
+        lines.append(f"- {path}: " + "; ".join(parts))
+    return "\n".join(lines)
+
+def _repair_touches_risky_field(parsed: Any) -> bool:
+    """True if a (successfully re-parsed) repaired plan sets any of the
+    file-content fields in RISKY_CONTENT_FIELDS.
+
+    Used only on the repair path in ``Reasoner._call_model`` -- a plan that
+    parsed cleanly on the first try (no repair needed) is never subject to
+    this check, since there was nothing to silently truncate.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    params = parsed.get("parameters")
+    if not isinstance(params, dict):
+        return False
+    return any(field in params for field in RISKY_CONTENT_FIELDS)
+

@@ -87,7 +87,8 @@ class Agent:
         current_state: dict = {
             "repo_path": repo_path,
             "test_command": test_command,
-            "file_cache": {}
+            "file_cache": {},
+            "files_read": {}, 
         }
 
         # blindness on iteration 1.
@@ -300,6 +301,49 @@ class Agent:
             ## 6. Update persistent state, including the file cache.
             _update_file_cache(current_state, action, result)
 
+            # Update the persistent files manifest so the Reasoner always knows what's
+            # been read AND what's been modified since, independent of the rolling
+            # last-5-actions window (which truncates and can drop this by later
+            # iterations). A file read at iteration 2 but modified at iteration 5
+            # means the Reasoner's mental model of its exact content/line numbers
+            # from that earlier read is now stale.
+            WRITE_TOOLS = {"write_to_file", "replace_in_file", "edit_file", "replace_lines", "delete_file"}
+
+            if "error" not in result:
+                params = action.get("parameters") or {}
+                file_path = params.get("path", "")
+                tool = action.get("tool")
+
+                if file_path and (tool == "read_file" or tool in WRITE_TOOLS):
+                    entry = current_state.setdefault("files_read", {}).setdefault(file_path, {})
+
+                    if tool == "read_file":
+                        total_lines = result.get("total_lines")
+                        start = params.get("start_line")
+                        end = params.get("end_line")
+                        if start or end:
+                            range_str = f"{start or 1}-{end or total_lines or '?'}"
+                        elif total_lines:
+                            range_str = f"1-{total_lines}"
+                        else:
+                            range_str = "full file"
+                        entry["lines"] = total_lines
+                        entry["last_read_iteration"] = iteration + 1
+                        entry["last_range_read"] = range_str
+
+                    elif tool == "delete_file":
+                        entry["deleted_at_iteration"] = iteration + 1
+                        entry.pop("last_modified_iteration", None)
+
+                    else:  # write_to_file, replace_in_file, edit_file, replace_lines
+                        entry["last_modified_iteration"] = iteration + 1
+                        entry["last_modified_tool"] = tool
+                        entry.pop("deleted_at_iteration", None)
+                        # Any prior read is now stale -- exact line numbers/content may
+                        # have shifted (especially after replace_lines, which can change
+                        # the file's total line count).
+                        entry["stale_since_last_read"] = "last_read_iteration" in entry
+
             current_state["last_plan"] = reasoner_plan
             current_state["last_action"] = action
             current_state["last_result"] = result
@@ -311,6 +355,32 @@ class Agent:
                 "action": action,
                 "result": result,
             })
+
+            # Update the persistent files-read manifest so the Reasoner always knows
+            # what's already been inspected, independent of the rolling last-5-actions
+            # window (which truncates and can drop this entirely by later iterations).
+            if action.get("tool") == "read_file" and "error" not in result:
+                file_path = (action.get("parameters") or {}).get("path", "")
+                if file_path:
+                    total_lines = result.get("total_lines")
+                    read_params = action.get("parameters") or {}
+                    start = read_params.get("start_line")
+                    end = read_params.get("end_line")
+                    if start or end:
+                        range_str = f"{start or 1}-{end or total_lines or '?'}"
+                    elif total_lines:
+                        range_str = f"1-{total_lines}"
+                    else:
+                        range_str = "full file"
+                    current_state.setdefault("files_read", {})[file_path] = {
+                        "lines": total_lines,
+                        "last_read_iteration": iteration + 1,
+                        "last_range_read": range_str,
+                    }
+
+            current_state["last_plan"] = reasoner_plan
+            current_state["last_action"] = action
+            current_state["last_result"] = result
 
             # 8. Check test results
             if action.get("tool") == "run_tests":

@@ -64,6 +64,21 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "optional": ["diff"],
         "description": "Return the current uncommitted (or `diff`-ref-relative) git diff of the workspace.",
     },
+    "replace_lines": {
+    "required": ["path", "start_line", "end_line", "content"],
+    "optional": ["expected_line_count"],
+    "description": (
+        "Replace an inclusive 1-indexed line range [start_line, end_line] in "
+        "the file at `path` with `content` (a string; use \\n for multiple "
+        "lines). Use this instead of replace_in_file when you already know "
+        "the exact line numbers (e.g. from a prior read_file or search_code "
+        "call) and don't want to retype the exact original text as a search "
+        "anchor. Optionally pass `expected_line_count` (end_line - start_line "
+        "+ 1) as a safety check -- if the file has since changed and that "
+        "count no longer matches, the edit is rejected rather than silently "
+        "clobbering the wrong lines."
+    ),
+},
 }
 
 

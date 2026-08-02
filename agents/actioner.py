@@ -88,30 +88,38 @@ class Actioner:
         return None
 
     def _resolve_path(self, path: str) -> str:
-        """Resolve a file path against the current workspace.
+        """Resolve a file path against the current workspace, and refuse to
+        let it escape outside workspace_dir.
 
         Supports an explicit '@workspace:relative/path' prefix, and also
-        treats any plain relative path as relative to workspace_dir (rather
-        than the process's ambient cwd) since that's what callers actually
-        produce in practice. Absolute paths pass through unchanged.
-
-        The Actioner/LLM is only ever expected to produce paths relative to
-        the workspace -- this method (the deterministic executor's
-        responsibility, not the LLM's) is what actually anchors them to
-        ``self.workspace_dir``.
+        treats any plain relative path as relative to workspace_dir. Absolute
+        paths are only accepted if they're already inside workspace_dir --
+        anything else (the model hallucinating a path outside the sandbox,
+        e.g. into the shared cloned repo instead of this instance's worktree)
+        is rejected rather than silently executed.
         """
         import os
+
+        workspace_root = os.path.realpath(self.workspace_dir)
 
         if path.startswith("@"):
             parts = path.split(":", 1)
             if len(parts) == 2 and parts[0] == "@workspace":
-                return os.path.join(self.workspace_dir, parts[1])
-            return path
+                candidate = os.path.join(self.workspace_dir, parts[1])
+            else:
+                candidate = path
+        elif os.path.isabs(path):
+            candidate = path
+        else:
+            candidate = os.path.join(self.workspace_dir, path)
 
-        if os.path.isabs(path):
-            return path
-
-        return os.path.join(self.workspace_dir, path)
+        resolved = os.path.realpath(candidate)
+        if os.path.commonpath([resolved, workspace_root]) != workspace_root:
+            raise ValueError(
+                f"Path '{path}' resolves outside the workspace ({workspace_root}). "
+                "All file operations must stay inside the workspace."
+            )
+        return resolved
 
     def execute(self, action: dict[str, Any]) -> dict[str, Any]:
         """Deterministically execute a single validated tool call.
@@ -174,8 +182,71 @@ class Actioner:
                     "total_lines": total_lines,
                 }
 
+            elif tool_name == "replace_lines":
+                path = self._resolve_path(params.get("path", ""))
+                with open(path, 'r') as f:
+                    lines = f.readlines()
+
+                total_lines = len(lines)
+
+                def _to_int(v):
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        return None
+
+                start_line = _to_int(params.get("start_line"))
+                end_line = _to_int(params.get("end_line"))
+
+                if start_line is None or end_line is None:
+                    return {"tool": tool_name, "error": "start_line and end_line must be integers."}
+                if start_line < 1 or end_line < start_line:
+                    return {"tool": tool_name, "error": f"Invalid range start_line={start_line}, end_line={end_line}."}
+                if end_line > total_lines:
+                    return {
+                        "tool": tool_name,
+                        "error": f"end_line={end_line} is beyond the file's {total_lines} lines.",
+                    }
+
+                expected_count = params.get("expected_line_count")
+                if expected_count not in (None, ""):
+                    expected_count = _to_int(expected_count)
+                    actual_count = end_line - start_line + 1
+                    if expected_count != actual_count:
+                        return {
+                            "tool": tool_name,
+                            "error": (
+                                f"expected_line_count={expected_count} doesn't match the "
+                                f"range's actual span ({actual_count} lines). The file may "
+                                "have changed since you last read it -- re-read it before "
+                                "editing to get correct line numbers."
+                            ),
+                        }
+
+                new_text = params.get("content", "")
+                # Preserve a trailing newline on the inserted block so subsequent lines
+                # don't get glued onto it, unless the caller's content already ends
+                # with one.
+                if new_text and not new_text.endswith("\n"):
+                    new_text += "\n"
+                new_lines = new_text.splitlines(keepends=True)
+
+                updated = lines[:start_line - 1] + new_lines + lines[end_line:]
+                with open(path, 'w') as f:
+                    f.writelines(updated)
+
+                return {
+                    "tool": tool_name,
+                    "result": (
+                        f"Replaced lines {start_line}-{end_line} ({end_line - start_line + 1} "
+                        f"line(s)) in {path} with {len(new_lines)} new line(s)."
+                    ),
+                }
+
             elif tool_name == "write_to_file":
                 path = self._resolve_path(params.get("path", ""))
+                import os
+                os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, 'w') as f:
                     f.write(params.get("content", ""))
                 return {"tool": tool_name, "result": f"File written to {path}"}
@@ -185,22 +256,29 @@ class Actioner:
                 with open(path, 'r') as f:
                     content = f.read()
 
-                # Simple SEARCH/REPLACE logic
                 search_text = params.get("search", "")
                 replace_text = params.get("replace", "")
-                new_content = content.replace(search_text, replace_text, 1)  # first occurrence only
-                if search_text in content:
-                    with open(path, 'w') as f:
-                        f.write(new_content)
-                    return {"tool": tool_name, "result": "Replaced text successfully"}
-                else:
-                    # NEW: try again ignoring per-line leading/trailing whitespace
-                    fuzzy_result = self._fuzzy_replace(content, search_text, replace_text)
-                    if fuzzy_result is not None:
-                        with open(path, 'w') as f:
-                            f.write(fuzzy_result)
-                        return {"tool": tool_name, "result": "Replaced text successfully (fuzzy match)"}
-                    return {"tool": tool_name, "error": f"SEARCH/REPLACE failed. Text not found in {path}"}
+
+                if not search_text:
+                    return {"tool": tool_name, "error": "`search` cannot be empty."}
+
+                occurrences = content.count(search_text)
+                if occurrences == 0:
+                    return {"tool": tool_name, "error": f"SEARCH text not found in {path}."}
+                if occurrences > 1:
+                    return {
+                        "tool": tool_name,
+                        "error": (
+                            f"SEARCH text appears {occurrences} times in {path}; refusing to "
+                            "guess which one. Include more surrounding lines in `search` so "
+                            "it matches exactly once."
+                        ),
+                    }
+
+                new_content = content.replace(search_text, replace_text, 1)
+                with open(path, 'w') as f:
+                    f.write(new_content)
+                return {"tool": tool_name, "result": f"Replaced text in {path} (1 occurrence)."}
 
             elif tool_name == "delete_file":
                 path = self._resolve_path(params.get("path", ""))
@@ -354,10 +432,11 @@ You are operating in this workspace:
 
 You MUST NOT invent a different workspace.
 All relative paths are relative to this workspace.
+Do not use absolute paths under any circumstances -- always give paths
+relative to the workspace shown above. Any absolute path outside this
+workspace will be rejected.
 Do not create unrelated files.
 Do not invent projects.
-Do not use example paths such as /home/user/project or any absolute path
-from an example or a previous, unrelated task.
 
 The Reasoner has already decided WHAT should happen next. Your only job is
 to translate that decision into exactly ONE concrete tool call matching
@@ -462,6 +541,33 @@ Do not put the tool parameters at the top level.
         # Swap placeholder tokens back for the real (large) values the model
         # never actually had to see or regenerate.
         action = _restore_large_values(action, placeholders)
+
+        # Small local models are prone to using a slightly different key name
+        # than the schema expects (e.g. "file_path" instead of "path") even
+        # when json_mode constrains the JSON to be syntactically valid -- it
+        # doesn't constrain which keys get used. Remap known aliases before
+        # validating, rather than rejecting an otherwise-usable action outright.
+        PARAM_ALIASES = {
+            "read_file": ["file_path", "filepath", "filename", "file"],
+            "write_to_file": ["file_path", "filepath", "filename", "file"],
+            "delete_file": ["file_path", "filepath", "filename", "file"],
+            "replace_in_file": ["file_path", "filepath", "filename", "file"],
+        }
+
+        if isinstance(action, dict) and action.get("tool") in PARAM_ALIASES:
+            params = action.get("parameters")
+            if isinstance(params, dict) and "path" not in params:
+                for alias in PARAM_ALIASES[action["tool"]]:
+                    if alias in params:
+                        params["path"] = params.pop(alias)
+                        break
+            action["parameters"] = params
+
+        is_valid, error = validate_action(action)
+        if not is_valid:
+            print(f"[Actioner] Rejected invalid action from model: {error}")
+            print(f"[Actioner] Raw action: {action!r}")
+            return None
 
         is_valid, error = validate_action(action)
         if not is_valid:

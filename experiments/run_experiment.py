@@ -166,8 +166,13 @@ def run_experiment(
     reasoner = Reasoner(model_id=reasoner_model, timeout_seconds=reasoner_timeout, num_ctx=reasoner_num_ctx)
 
     print(f"[Experiment] Initializing Actioner (model={actioner_model}, request_timeout={actioner_timeout}s, "
-          f"num_ctx={actioner_num_ctx})...")
-    actioner = Actioner(model_id=actioner_model, timeout_seconds=actioner_timeout, num_ctx=actioner_num_ctx)
+        f"num_ctx={actioner_num_ctx}, max_read_lines={actioner_max_read_lines})...")
+    actioner = Actioner(
+        model_id=actioner_model,
+        timeout_seconds=actioner_timeout,
+        num_ctx=actioner_num_ctx,
+        max_read_lines=actioner_max_read_lines,
+    )
 
     agent_max_iter = config.get("agent", {}).get("max_iterations", 50)
     agent_timeout = config.get("agent", {}).get("timeout_seconds", None)
