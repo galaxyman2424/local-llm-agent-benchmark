@@ -25,6 +25,8 @@ from .json_utils import extract_json_object, repair_truncated_json
 # the context ceiling mid-JSON well before num_predict would ever apply.
 DEFAULT_NUM_CTX = 16384
 
+MAX_READ_LINES = 300
+
 
 class Actioner:
     """Handles execution of tool calls and other actions.
@@ -33,21 +35,29 @@ class Actioner:
     including file operations, code search, command execution, and test running.
     """
 
+class Actioner:
     def __init__(
         self,
         model_id="ornith:9b",
         workspace_dir=None,
         timeout_seconds: float = 120.0,
         num_ctx: int = DEFAULT_NUM_CTX,
+        max_read_lines: int = 300,
     ):
         """``timeout_seconds`` is the max time for a single Ollama request
         (the Actioner's translate-plan-to-tool-call call), independent of
         the agent's overall per-task timeout configured elsewhere.
+
+        ``max_read_lines`` caps how many lines a single read_file call
+        returns (see `execute`'s read_file branch) -- keep this in step
+        with the model's num_ctx: a bigger context window can afford a
+        bigger visible slice per read.
         """
         self.model_id = model_id
         self.workspace_dir = workspace_dir or "."
         self.timeout_seconds = timeout_seconds
         self.num_ctx = num_ctx
+        self.max_read_lines = max_read_lines
         self.client = OllamaClient(
             model=model_id,
             timeout_seconds=timeout_seconds,
@@ -122,17 +132,47 @@ class Actioner:
         try:
             if tool_name == "read_file":
                 path = self._resolve_path(params.get("path", ""))
-                with open(path, "r") as f:
+                with open(path, 'r') as f:
                     lines = f.readlines()
-                start = params.get("start_line")
-                end = params.get("end_line")
-                if start or end:
-                    s = max((start or 1) - 1, 0)
-                    e = end or len(lines)
-                    content = "".join(lines[s:e])
-                else:
-                    content = "".join(lines)
-                return {"tool": tool_name, "result": content}
+
+                total_lines = len(lines)
+                requested_range = params.get("start_line") is not None or params.get("end_line") is not None
+
+                def _to_int(v, default):
+                    try:
+                        return int(v) if v not in (None, "") else default
+                    except (TypeError, ValueError):
+                        return default
+
+                start_line = max(1, _to_int(params.get("start_line"), 1))
+                end_line = min(total_lines, _to_int(params.get("end_line"), total_lines))
+                if end_line < start_line:
+                    end_line = start_line
+
+                notice = ""
+                if end_line - start_line + 1 > self.max_read_lines:
+                    capped_end = start_line + self.max_read_lines - 1
+                    notice = (
+                        f"\n... [showing lines {start_line}-{capped_end} of {total_lines} total; "
+                        f"re-run read_file with start_line/end_line to see more]"
+                    )
+                    end_line = capped_end
+                elif not requested_range and total_lines > self.max_read_lines:
+                    end_line = self.max_read_lines
+                    notice = (
+                        f"\n... [file has {total_lines} lines total; showing 1-{end_line}. "
+                        f"Re-run read_file with start_line/end_line to see more]"
+                    )
+
+                numbered = "".join(f"{i}: {lines[i-1]}" for i in range(start_line, end_line + 1))
+                if numbered and not numbered.endswith("\n"):
+                    numbered += "\n"
+
+                return {
+                    "tool": tool_name,
+                    "result": numbered + notice,
+                    "total_lines": total_lines,
+                }
 
             elif tool_name == "write_to_file":
                 path = self._resolve_path(params.get("path", ""))
@@ -148,7 +188,7 @@ class Actioner:
                 # Simple SEARCH/REPLACE logic
                 search_text = params.get("search", "")
                 replace_text = params.get("replace", "")
-                new_content = content.replace(search_text, replace_text)
+                new_content = content.replace(search_text, replace_text, 1)  # first occurrence only
                 if search_text in content:
                     with open(path, 'w') as f:
                         f.write(new_content)

@@ -157,7 +157,9 @@ def run_experiment(
     # agents/reasoner.py's DEFAULT_NUM_CTX docstring. Too small a value here
     # is the actual cause of replies truncating mid-JSON, not num_predict.
     reasoner_num_ctx = config.get("reasoner", {}).get("num_ctx") or get_model_max_context(reasoner_model) or 16384
-    actioner_num_ctx = config.get("actioner", {}).get("num_ctx") or get_model_max_context(actioner_model) or 16384
+    
+    actioner_num_ctx = config.get("actioner", {}).get("num_ctx", 16384)
+    actioner_max_read_lines = config.get("actioner", {}).get("max_read_lines", 300)
 
     print(f"[Experiment] Initializing Reasoner (model={reasoner_model}, request_timeout={reasoner_timeout}s, "
           f"num_ctx={reasoner_num_ctx})...")

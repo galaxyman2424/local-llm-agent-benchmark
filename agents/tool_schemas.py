@@ -17,7 +17,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "read_file": {
         "required": ["path"],
         "optional": ["start_line", "end_line"],
-        "description": "Read `path`. Optionally restrict to a 1-indexed line range via start_line/end_line for large files.",
+        "description": (
+            "Read the contents of a file at `path` (relative to the workspace). "
+            "Output is prefixed with line numbers. Optionally provide `start_line`/"
+            "`end_line` (1-indexed, inclusive) to read a range instead of the whole "
+            "file -- required for files longer than ~300 lines."
+        ),
     },
     "write_to_file": {
         "required": ["path", "content"],

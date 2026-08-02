@@ -222,6 +222,36 @@ class Agent:
 
                 continue
 
+            if _is_cached_listing(current_state, action):
+                listing_path = (action.get("parameters") or {}).get("path") or "."
+
+                print(
+                    "[Agent] Rejecting redundant list_directory for cached path: {}".format(
+                        listing_path
+                    )
+                )
+
+                # Same pattern as the cached-read short-circuit above: feed
+                # back the cached listing as the result rather than an
+                # error, so the Reasoner still sees the directory contents
+                # in its history and isn't left guessing why the call was
+                # skipped -- it just shouldn't need to list the same,
+                # unchanged directory a second time.
+                listing_cache = current_state.get("listing_cache", {})
+                cached_listing = listing_cache.get(listing_path, [])
+
+                previous_actions.append({
+                    "iteration": iteration,
+                    "reasoner_plan": reasoner_plan,
+                    "action": action,
+                    "result": {
+                        "tool": "list_directory",
+                        "result": cached_listing,
+                    },
+                })
+
+                continue
+
             # 4. Loop detection: same tool+parameters repeated too often
             action_key = (action.get("tool"), _stable_repr(action.get("parameters", {})))
             if action_key == last_action_key:
@@ -240,7 +270,7 @@ class Agent:
             action_window.append(action_key)
             window = list(action_window)
             cycle_detected = False
-            for period in (2, 3):
+            for period in (1, 2, 3):
                 if len(window) >= period * 2 and window[-period:] == window[-2 * period:-period]:
                     cycle_detected = True
                     break
@@ -376,6 +406,27 @@ def _update_file_cache(
     parameters = action.get("parameters") or {}
     path = parameters.get("path")
 
+    # list_directory's `path` is optional (defaults to the workspace root),
+    # so it must be handled before the `if not path: return` guard below --
+    # otherwise every list_directory call with no explicit path (the common
+    # case) would silently skip caching entirely.
+    if tool == "list_directory":
+        if "error" not in result:
+            listing_cache = current_state.setdefault("listing_cache", {})
+            listing_path = parameters.get("path") or "."
+            listing_cache[listing_path] = result.get("result", [])
+        return
+
+    # write_to_file/delete_file can add or remove entries from a directory
+    # listing anywhere in the tree -- rather than tracking exactly which
+    # directory each path belongs to, just invalidate every cached listing
+    # so a later list_directory reflects the change instead of silently
+    # returning a stale snapshot from before the write/delete. Checked here,
+    # before the path guard, since these tools always have a path but the
+    # listing_cache itself isn't keyed by that path.
+    if tool in {"write_to_file", "delete_file"} and "error" not in result:
+        current_state["listing_cache"] = {}
+
     if not path:
         return
 
@@ -472,3 +523,25 @@ def _is_cached_read(
             return True
 
     return False
+
+def _is_cached_listing(
+    current_state: dict,
+    action: dict,
+) -> bool:
+    """Return True if list_directory requests a path already cached.
+
+    Mirrors ``_is_cached_read`` for the same reason: a small local model
+    frequently re-lists an unchanged directory (e.g. the repo root) several
+    times in a row while orienting itself, and unlike read_file this wasn't
+    being deduplicated at all before, so it slipped past the file-cache
+    short-circuit and only got caught later (if at all) by the loop's
+    repeated-action detection.
+    """
+    if action.get("tool") != "list_directory":
+        return False
+
+    parameters = action.get("parameters") or {}
+    listing_path = parameters.get("path") or "."
+
+    listing_cache = current_state.get("listing_cache", {})
+    return listing_path in listing_cache

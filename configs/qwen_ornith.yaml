@@ -9,6 +9,7 @@ actioner:
   model: ornith:9b
   timeout_seconds: 300  # max seconds for a single Ollama request
   num_ctx: 131072
+  max_read_lines: 300
 
 agent:
   max_iterations: 50

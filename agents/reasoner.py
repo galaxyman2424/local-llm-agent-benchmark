@@ -33,6 +33,34 @@ REPEATED_ACTION_THRESHOLD = 2
 # for every planning call.
 DEFAULT_NUM_CTX = 131072
 
+# Fields whose value is literal file/code content that gets written
+# straight to disk by the Actioner (write_to_file's `content`,
+# replace_in_file's `search`/`replace`). repair_truncated_json() can turn a
+# reply that was cut off mid-generation into syntactically valid JSON by
+# just closing the open string wherever generation happened to stop -- that
+# makes the JSON parse, but if the cut-off point was inside one of these
+# fields, the "repaired" value is a silently truncated/corrupted piece of
+# code, not a safe approximation. A truncated `expected_outcome` or search
+# `query` is harmless prose; a truncated `replace` is a broken file waiting
+# to happen. So a repair that touches any of these fields is never trusted.
+RISKY_CONTENT_FIELDS = ("content", "search", "replace")
+
+
+def _repair_touches_risky_field(parsed: Any) -> bool:
+    """True if a (successfully re-parsed) repaired plan sets any of the
+    file-content fields in RISKY_CONTENT_FIELDS.
+
+    Used only on the repair path in ``Reasoner._call_model`` -- a plan that
+    parsed cleanly on the first try (no repair needed) is never subject to
+    this check, since there was nothing to silently truncate.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    params = parsed.get("parameters")
+    if not isinstance(params, dict):
+        return False
+    return any(field in params for field in RISKY_CONTENT_FIELDS)
+
 
 class Reasoner:
     """Reasoning component that analyzes tasks and produces action plans."""
@@ -171,15 +199,12 @@ Guidance:
 - Use search_code with concrete identifiers extracted from the task
   (function/class names, file names, error messages) -- never paste the
   entire task description as a search query.
-- For long files, prefer read_file with start_line/end_line to read a
-  specific slice instead of trying to dump the whole file at once.
-- If a file is already partially cached, you can request a different
-  line range for that same path to add more context; the loop will merge
-  it into the cached file description.
+- For files you expect to be large, or after a search_code hit gives you a
+  line number, use read_file's start_line/end_line to read just the
+  relevant section instead of the whole file.
 - Only choose write_to_file when a brand new file is genuinely required;
   prefer replace_in_file for editing existing files.
 - Never invent a project, path, or workspace unrelated to this task.
-
 Return ONLY a JSON object with exactly these fields:
 
 {{
@@ -279,13 +304,32 @@ Return only the JSON object, nothing else."""
             if repaired is not None:
                 try:
                     parsed = _json.loads(repaired)
+                except _json.JSONDecodeError:
+                    parsed = None
+
+                if parsed is not None:
+                    if _repair_touches_risky_field(parsed):
+                        # The truncation happened somewhere inside content/
+                        # search/replace -- repair_truncated_json only closed
+                        # the open string, it did not recover the missing
+                        # tail. Writing this to disk could silently corrupt a
+                        # real file (e.g. an unterminated string literal) in
+                        # a way the model itself has no way to notice later.
+                        # Treat this exactly like an unparseable reply so the
+                        # caller's existing short-prompt retry kicks in,
+                        # instead of returning a plan we can't trust.
+                        print("[Reasoner] Model reply was truncated mid-JSON while "
+                              "generating a file-content field (content/search/"
+                              "replace) -- refusing to trust the repaired value "
+                              "since it may be silently truncated code. Treating "
+                              "this call as failed so it gets retried.")
+                        return None
+
                     print("[Reasoner] Model reply was truncated mid-JSON (likely num_ctx too small "
                           f"for this prompt: prompt_eval_count={response.get('prompt_eval_count', '?')} "
                           f"eval_count={response.get('eval_count', '?')} num_ctx={self.num_ctx}); "
                           "repaired it and continuing.")
                     return parsed
-                except _json.JSONDecodeError:
-                    pass
 
             print("[Reasoner] Model reply contained no JSON object (and could not be repaired)")
             print(f"[Reasoner] done_reason={response.get('done_reason', '?')} "
