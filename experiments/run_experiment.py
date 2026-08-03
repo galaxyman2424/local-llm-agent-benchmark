@@ -83,6 +83,8 @@ def run_experiment(
     reasoner_model: str | None = None,
     actioner_model: str | None = None,
     run_name: str | None = None,
+    repo_filter: str | None = None,
+    pure_python_only: bool = False,
 ) -> dict:
     """Run a complete experiment based on the given config.
 
@@ -119,6 +121,20 @@ def run_experiment(
         If given, used as the summary filename stem instead of the config
         file's stem -- needed so multiple combinations sharing one base
         config don't overwrite each other's summary.json.
+    repo_filter : str | None
+        If given, only run instances whose ``repo`` field contains this
+        substring (case-insensitive), e.g. ``"requests"``. Lets you prove
+        out the Reasoner/Actioner architecture on a specific repo before
+        paying the environment-setup cost of the full grid.
+    pure_python_only : bool
+        If True, restrict to the subset of SWE-bench Lite repos that don't
+        require compiling numpy/scipy/pandas/matplotlib-style C extensions
+        (see ``swebench.utils.PURE_PYTHON_REPOS``) -- most of
+        ``ensure_repo_environment``'s complexity exists to survive that
+        build pain, which has nothing to do with whether the agent
+        architecture itself works. Combine with a small ``--limit`` for
+        fast early iteration on real instances with real scoring, before
+        trusting a resolve-rate number from the full (slower) dataset.
 
     Returns
     -------
@@ -137,8 +153,21 @@ def run_experiment(
     # Load dataset for instance selection
     from swebench.utils import load_dataset, find_repo_path
     dataset_list = load_dataset(str(seed_repos_dir / "dataset.jsonl"))
-    dataset = {"instances": {inst.get("instance_id", f"instance_{i}"): inst for i, inst in enumerate(dataset_list)}}
     print(f"[Experiment] Loaded {len(dataset_list)} instances from dataset")
+
+    if pure_python_only:
+        from swebench.utils import filter_pure_python_instances
+        before = len(dataset_list)
+        dataset_list = filter_pure_python_instances(dataset_list)
+        print(f"[Experiment] --pure-python-only: kept {len(dataset_list)}/{before} instances "
+              "(skipping repos that need numpy/scipy/pandas/matplotlib-style C-extension builds)")
+
+    if repo_filter:
+        before = len(dataset_list)
+        dataset_list = [inst for inst in dataset_list if repo_filter.lower() in inst.get("repo", "").lower()]
+        print(f"[Experiment] --repo-filter={repo_filter!r}: kept {len(dataset_list)}/{before} instances")
+
+    dataset = {"instances": {inst.get("instance_id", f"instance_{i}"): inst for i, inst in enumerate(dataset_list)}}
 
     # Initialize agents (explicit overrides win over the config file)
     from agents import Reasoner, Actioner, Agent
@@ -156,9 +185,9 @@ def run_experiment(
     # num_ctx (context window) is a SEPARATE knob from num_predict -- see
     # agents/reasoner.py's DEFAULT_NUM_CTX docstring. Too small a value here
     # is the actual cause of replies truncating mid-JSON, not num_predict.
-    reasoner_num_ctx = config.get("reasoner", {}).get("num_ctx") or get_model_max_context(reasoner_model) or 16384
-    
-    actioner_num_ctx = config.get("actioner", {}).get("num_ctx", 16384)
+    reasoner_num_ctx = config.get("reasoner", {}).get("num_ctx")
+    actioner_num_ctx = config.get("actioner", {}).get("num_ctx")
+
     actioner_max_read_lines = config.get("actioner", {}).get("max_read_lines", 300)
 
     print(f"[Experiment] Initializing Reasoner (model={reasoner_model}, request_timeout={reasoner_timeout}s, "
@@ -321,6 +350,11 @@ if __name__ == "__main__":
     parser.add_argument("--reasoner-model", type=str, default=None, help="Override the config's reasoner model")
     parser.add_argument("--actioner-model", type=str, default=None, help="Override the config's actioner model")
     parser.add_argument("--run-name", type=str, default=None, help="Summary filename stem (default: config file stem)")
+    parser.add_argument("--repo-filter", type=str, default=None,
+                         help="Only run instances whose repo contains this substring, e.g. 'requests'")
+    parser.add_argument("--pure-python-only", action="store_true",
+                         help="Only run repos that don't need C-extension builds (numpy/scipy/pandas/"
+                              "matplotlib-style deps) -- cheaper/faster signal for early iteration")
     args = parser.parse_args()
 
     result = run_experiment(
@@ -329,5 +363,7 @@ if __name__ == "__main__":
         reasoner_model=args.reasoner_model,
         actioner_model=args.actioner_model,
         run_name=args.run_name,
+        repo_filter=args.repo_filter,
+        pure_python_only=args.pure_python_only,
     )
     print(json.dumps(result, indent=2))

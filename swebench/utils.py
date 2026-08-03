@@ -611,6 +611,40 @@ def save_logs(log_path: str | Path, log_entries: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cheap-subset filtering (pure-Python repos, no C-extension build pain)
+# ---------------------------------------------------------------------------
+#
+# SWE-bench Lite spans 12 repos. Several of them (astropy, matplotlib,
+# scikit-learn, pandas-adjacent xarray/seaborn) pull in numpy/scipy/pandas/
+# matplotlib and sometimes need an old setuptools or submodule fetching just
+# to build -- see ensure_repo_environment() below, most of whose complexity
+# exists purely to survive that. None of that build pain has anything to do
+# with whether the Reasoner/Actioner split actually works, so for early
+# iteration it's worth being able to filter it out while still running the
+# real dataset and the real FAIL_TO_PASS/PASS_TO_PASS scoring.
+PURE_PYTHON_REPOS: tuple[str, ...] = (
+    "django/django",
+    "pallets/flask",
+    "psf/requests",
+    "pylint-dev/pylint",
+    "pytest-dev/pytest",
+    "sphinx-doc/sphinx",
+    "sympy/sympy",
+)
+
+
+def filter_pure_python_instances(instances: list[dict]) -> list[dict]:
+    """Keep only instances whose ``repo`` is in :data:`PURE_PYTHON_REPOS`.
+
+    A cheap way to get a faster-iterating subset of SWE-bench Lite (no
+    numpy/scipy/matplotlib/pandas C-extension builds) while still running
+    real instances with real FAIL_TO_PASS/PASS_TO_PASS scoring, instead of
+    switching to a synthetic or non-SWE-bench task.
+    """
+    return [inst for inst in instances if inst.get("repo") in PURE_PYTHON_REPOS]
+
+
+# ---------------------------------------------------------------------------
 # FAIL_TO_PASS / PASS_TO_PASS evaluation
 # ---------------------------------------------------------------------------
 #
@@ -708,6 +742,7 @@ def evaluate_fail_to_pass(
     instance: dict[str, Any],
     timeout: float = 60.0,
     python_bin: str = "python",
+    test_patch_already_applied: bool = False,
 ) -> dict[str, Any]:
     """Run the FAIL_TO_PASS / PASS_TO_PASS check for one instance.
 
@@ -731,6 +766,15 @@ def evaluate_fail_to_pass(
     python_bin :
         Python executable to run tests with -- see :func:`run_test_ids`.
         Pass the result of :func:`ensure_repo_environment` (repo_path) here.
+    test_patch_already_applied :
+        Set to ``True`` when the caller already applied
+        ``instance["test_patch"]`` to ``repo_path`` earlier in the run --
+        e.g. before handing the workspace to the agent, so the agent's own
+        ``run_tests`` calls can target real FAIL_TO_PASS node ids instead of
+        a generic command (see ``Agent.solve``'s ``fail_to_pass_tests``
+        parameter). Applying the same unified diff twice would fail with
+        "patch does not apply", which would misreport a genuine non-issue
+        as ``patch_failure``; this flag skips the redundant re-application.
 
     Returns
     -------
@@ -747,7 +791,7 @@ def evaluate_fail_to_pass(
     pass_to_pass = parse_test_id_list(instance.get("PASS_TO_PASS"))
 
     test_patch = instance.get("test_patch", "")
-    if test_patch:
+    if test_patch and not test_patch_already_applied:
         try:
             apply_patch(repo_path, test_patch)
         except Exception as e:

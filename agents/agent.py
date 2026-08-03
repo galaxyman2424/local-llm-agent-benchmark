@@ -77,18 +77,54 @@ class Agent:
         self.max_iterations = max_iterations
         self.timeout = timeout
 
-    def solve(self, repo_path, task, test_command="pytest --tb=short", python_bin: str | None = None) -> AgentResult:
-        """Run the agent on a single SWE-bench-style task."""
+    def solve(
+        self,
+        repo_path,
+        task,
+        test_command="pytest --tb=short",
+        python_bin: str | None = None,
+        fail_to_pass_tests: list[str] | None = None,
+        pass_to_pass_tests: list[str] | None = None,
+    ) -> AgentResult:
+        """Run the agent on a single SWE-bench-style task.
+
+        Parameters
+        ----------
+        fail_to_pass_tests, pass_to_pass_tests
+            The instance's gold FAIL_TO_PASS / PASS_TO_PASS test node ids,
+            when known (e.g. from the SWE-bench Lite dataset). These are
+            just test *names*, not the solution -- the gold ``patch`` stays
+            hidden -- so there's no reason to withhold them from the agent.
+            When provided, they become BOTH the concrete goal stated to the
+            Reasoner (instead of a vague "make test_command pass") AND the
+            authoritative exit condition: after every ``run_tests`` call,
+            these specific node ids are re-checked directly (see
+            ``swebench.utils.run_test_ids``), rather than trusting the
+            return code of whatever ad hoc command the model happened to
+            run. Without this, a model could run `pytest some_unrelated_
+            test.py`, get returncode 0, and the loop would wrongly declare
+            victory -- the exit signal would be completely disconnected
+            from what the benchmark actually scores. When omitted (e.g. a
+            synthetic/local task with no gold test lists), the loop falls
+            back to the previous behavior of trusting the configured
+            ``test_command``'s return code.
+        """
         # Point the actioner at this task's repo so file/command tools
         # operate on the right workspace instead of the ambient cwd.
         self.actioner.workspace_dir = repo_path
         if python_bin:
             self.actioner.python_bin = python_bin
 
+        fail_to_pass_tests = fail_to_pass_tests or []
+        pass_to_pass_tests = pass_to_pass_tests or []
+
         previous_actions: list[dict] = []
         current_state: dict = {
             "repo_path": repo_path,
             "test_command": test_command,
+            "fail_to_pass_tests": fail_to_pass_tests,
+            "pass_to_pass_tests": pass_to_pass_tests,
+            "target_tests_passing": None,
             "file_cache": {},
             "files_read": {}, 
         }
@@ -387,13 +423,37 @@ class Agent:
 
             # 8. Check test results
             if action.get("tool") == "run_tests":
-                last_test_iteration = iteration 
-                test_passed = result.get("returncode") == 0
+                last_test_iteration = iteration
                 current_state["last_test_result"] = {
                     "returncode": result.get("returncode"),
                     "stdout": result.get("result", ""),
                     "stderr": result.get("stderr", ""),
                 }
+
+                if fail_to_pass_tests:
+                    # Authoritative check: ignore whether the arbitrary
+                    # command the model chose to run happened to return 0
+                    # (it may not even have touched the tests that matter)
+                    # and instead directly re-run the instance's own
+                    # FAIL_TO_PASS/PASS_TO_PASS node ids -- the same check
+                    # used at evaluation time, just run live so the loop's
+                    # own "am I done" signal is the same thing that will
+                    # actually be scored.
+                    target_status = _check_target_tests(
+                        repo_path=self.actioner.workspace_dir,
+                        python_bin=self.actioner.python_bin or "python",
+                        fail_to_pass_tests=fail_to_pass_tests,
+                        pass_to_pass_tests=pass_to_pass_tests,
+                    )
+                    current_state["target_test_results"] = target_status
+                    current_state["target_tests_passing"] = target_status["all_passing"]
+                    test_passed = target_status["all_passing"]
+                else:
+                    # No gold test list for this task (e.g. a synthetic/
+                    # local instance) -- fall back to trusting the
+                    # configured test_command's return code, as before.
+                    test_passed = result.get("returncode") == 0
+
                 if test_passed:
                     print("[Agent] Tests passed.")
                     stop_reason = "tests_passed"
@@ -454,6 +514,54 @@ class Agent:
                 return "\n".join(sorted(os.listdir(repo_path))[:max_files])
             except Exception:
                 return "(directory listing unavailable)"
+
+def _check_target_tests(
+    *,
+    repo_path: str,
+    python_bin: str,
+    fail_to_pass_tests: list[str],
+    pass_to_pass_tests: list[str],
+) -> dict:
+    """Run the instance's actual FAIL_TO_PASS/PASS_TO_PASS node ids live and
+    report whether every one currently passes.
+
+    This reuses ``swebench.utils.run_test_ids`` -- the exact same
+    per-node-id runner used by offline evaluation (``evaluate_fail_to_pass``)
+    -- so the loop's own "should I stop" signal matches what the benchmark
+    will actually score, rather than an independent, looser approximation.
+    Imported locally (like the rest of this codebase's cross-package
+    imports) to avoid a module-level dependency between the `agents` and
+    `swebench` packages.
+    """
+    try:
+        from swebench.utils import run_test_ids
+    except ImportError:
+        # swebench.utils isn't importable in this environment (e.g. a unit
+        # test or non-SWE-bench caller) -- don't crash the loop, just report
+        # "not confirmed" so the fallback returncode-based path never
+        # silently activates by accident.
+        return {
+            "fail_to_pass_results": {},
+            "pass_to_pass_results": {},
+            "all_passing": False,
+            "error": "swebench.utils.run_test_ids unavailable",
+        }
+
+    fail_to_pass_results = run_test_ids(repo_path, fail_to_pass_tests, python_bin=python_bin)
+    pass_to_pass_results = run_test_ids(repo_path, pass_to_pass_tests, python_bin=python_bin)
+
+    all_passing = (
+        bool(fail_to_pass_tests)
+        and all(v is True for v in fail_to_pass_results.values())
+        and all(v is True for v in pass_to_pass_results.values())
+    )
+
+    return {
+        "fail_to_pass_results": fail_to_pass_results,
+        "pass_to_pass_results": pass_to_pass_results,
+        "all_passing": all_passing,
+    }
+
 
 def _stable_repr(value) -> str:
     import json as _json

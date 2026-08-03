@@ -125,17 +125,63 @@ Provide your analysis as a structured JSON response with these fields:
             usable plan after a retry.
         """
         loop_warning = _loop_warning(previous_actions)
-        tests_confirmed_passing = _tests_passed(previous_actions)
 
-        done_rule = (
-            "You MAY choose \"done\" now, since a run_tests action with "
-            "returncode == 0 already appears in the previous actions above."
-            if tests_confirmed_passing else
-            "You MUST NOT choose \"done\" yet. No run_tests action with "
-            "returncode == 0 has occurred so far. If you believe the fix is "
-            "complete, your next_action MUST be \"run_tests\" to confirm it, "
-            "not \"done\"."
+        fail_to_pass_tests = (
+            current_state.get("fail_to_pass_tests", []) if isinstance(current_state, dict) else []
         )
+        pass_to_pass_tests = (
+            current_state.get("pass_to_pass_tests", []) if isinstance(current_state, dict) else []
+        )
+
+        if fail_to_pass_tests:
+            # We know the instance's actual gold test ids -- these are just
+            # test NAMES, not the solution (the gold `patch` stays hidden),
+            # so there's no reason to withhold them. Use the Agent's own
+            # authoritative live check (re-run after every run_tests call --
+            # see Agent.solve's fail_to_pass_tests handling) instead of the
+            # weaker "did the last run_tests return 0" heuristic, since the
+            # model could have run an unrelated command and gotten a
+            # misleading returncode 0.
+            tests_confirmed_passing = bool(
+                isinstance(current_state, dict) and current_state.get("target_tests_passing")
+            )
+            goal_block = f"""
+GOAL / EXIT CONDITION (this is exactly what will be scored -- not a vague
+"make the tests pass"):
+The fix is complete once ALL of the following specific tests pass:
+FAIL_TO_PASS (currently failing; must start passing):
+{chr(10).join(f"  - {t}" for t in fail_to_pass_tests)}
+PASS_TO_PASS (already passing; must keep passing -- do not regress these):
+{chr(10).join(f"  - {t}" for t in pass_to_pass_tests) if pass_to_pass_tests else "  (none tracked)"}
+Use run_tests to check your progress against these specific tests (e.g.
+"pytest {fail_to_pass_tests[0]}") rather than a generic full-suite command.
+"""
+            done_rule = (
+                "You MAY choose \"done\" now: the FAIL_TO_PASS and "
+                "PASS_TO_PASS tests listed above were just directly "
+                "re-checked and ALL of them currently pass."
+                if tests_confirmed_passing else
+                "You MUST NOT choose \"done\" yet. The FAIL_TO_PASS/"
+                "PASS_TO_PASS tests listed above have not all been "
+                "confirmed passing. If you believe the fix is complete, "
+                "your next_action MUST be \"run_tests\" to confirm it, not "
+                "\"done\" -- a generic run_tests call is re-checked "
+                "automatically against those specific tests."
+            )
+        else:
+            # No gold test list for this task (e.g. a synthetic/local
+            # instance) -- fall back to the previous, looser heuristic.
+            tests_confirmed_passing = _tests_passed(previous_actions)
+            goal_block = ""
+            done_rule = (
+                "You MAY choose \"done\" now, since a run_tests action with "
+                "returncode == 0 already appears in the previous actions above."
+                if tests_confirmed_passing else
+                "You MUST NOT choose \"done\" yet. No run_tests action with "
+                "returncode == 0 has occurred so far. If you believe the fix is "
+                "complete, your next_action MUST be \"run_tests\" to confirm it, "
+                "not \"done\"."
+            )
 
         file_cache = current_state.get("file_cache", {})
 
@@ -169,6 +215,8 @@ into a concrete tool call.
 
 TASK:
 {task}
+{goal_block}
+{done_rule}
 
 CURRENT STATE:
 {_truncate(state_for_prompt)}
@@ -572,4 +620,3 @@ def _repair_touches_risky_field(parsed: Any) -> bool:
     if not isinstance(params, dict):
         return False
     return any(field in params for field in RISKY_CONTENT_FIELDS)
-
