@@ -133,8 +133,32 @@ class SWEbenchBenchmark:
 
         task_text = task.get("task_description") or task.get("problem_statement", "")
         test_cmd = task.get("test_command", "pytest")
-        
-        agent_result = agent.solve(str(repo_path), task_text, test_command=test_cmd, python_bin=python_bin)
+
+        # Bring in the reference tests (test_patch) BEFORE the agent starts,
+        # so its own run_tests calls can target the real FAIL_TO_PASS node
+        # ids -- these are just test names, not the solution, so there's no
+        # reason to withhold them. The gold fix itself (`patch`) is never
+        # applied or shown to the agent.
+        from swebench.utils import parse_test_id_list, apply_patch
+        fail_to_pass = parse_test_id_list(task.get("FAIL_TO_PASS"))
+        pass_to_pass = parse_test_id_list(task.get("PASS_TO_PASS"))
+        test_patch = task.get("test_patch", "")
+        test_patch_applied = False
+        if test_patch:
+            try:
+                apply_patch(repo_path, test_patch)
+                test_patch_applied = True
+            except Exception as e:
+                record.status = "environment_error"
+                record.test_results = {"error": f"Failed to apply test_patch before agent run: {e}"}
+                record.end_time = time.time()
+                record.runtime = record.end_time - record.start_time
+                return record
+
+        agent_result = agent.solve(
+            str(repo_path), task_text, test_command=test_cmd, python_bin=python_bin,
+            fail_to_pass_tests=fail_to_pass, pass_to_pass_tests=pass_to_pass,
+        )
 
         record.exit_reason = getattr(agent_result, "exit_reason", "") or ""
         record.stop_reason = getattr(agent_result, "stop_reason", "") or ""
@@ -174,7 +198,10 @@ class SWEbenchBenchmark:
         #    pass while keeping PASS_TO_PASS tests passing?
         if task.get("FAIL_TO_PASS") or task.get("PASS_TO_PASS"):
             from swebench.utils import evaluate_fail_to_pass
-            f2p = evaluate_fail_to_pass(repo_path, task, timeout=60, python_bin=python_bin)
+            f2p = evaluate_fail_to_pass(
+                repo_path, task, timeout=60, python_bin=python_bin,
+                test_patch_already_applied=test_patch_applied,
+            )
             record.status = f2p["status"]
             record.fail_to_pass_count = f2p["fail_to_pass_count"]
             record.fail_to_pass_total = f2p["fail_to_pass_total"]

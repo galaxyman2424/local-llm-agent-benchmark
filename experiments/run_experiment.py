@@ -85,6 +85,7 @@ def run_experiment(
     run_name: str | None = None,
     repo_filter: str | None = None,
     pure_python_only: bool = False,
+    instances_per_repo: int | None = None,
 ) -> dict:
     """Run a complete experiment based on the given config.
 
@@ -135,6 +136,17 @@ def run_experiment(
         architecture itself works. Combine with a small ``--limit`` for
         fast early iteration on real instances with real scoring, before
         trusting a resolve-rate number from the full (slower) dataset.
+    instances_per_repo : int | None
+        If given, OVERRIDES ``limit`` and instead selects up to this many
+        instances from EACH repo present after filtering (preserving
+        dataset order within a repo), rather than the first N instances
+        overall (which could all come from a single repo if the dataset
+        happens to be sorted that way). Meant for a quick per-repo pilot --
+        e.g. ``instances_per_repo=1`` with ``pure_python_only=True`` runs
+        exactly one instance from each pure-Python repo, so you can see
+        whether failures are repo-specific (environment issues) or
+        model-specific (small-model reasoning/context limits) before
+        committing to a full run. See ``experiments/pilot_run.py``.
 
     Returns
     -------
@@ -218,7 +230,22 @@ def run_experiment(
 
     # Select instances
     instance_ids = list(dataset["instances"].keys())
-    if limit is not None:
+    if instances_per_repo is not None:
+        # Group by repo (preserving each repo's relative order) and keep the
+        # first `instances_per_repo` from each group, rather than the first
+        # N overall -- a plain `limit` could land entirely inside one repo
+        # if the dataset happens to be sorted/clustered by repo, which would
+        # defeat the point of a per-repo pilot.
+        by_repo: dict[str, list[str]] = {}
+        for iid in instance_ids:
+            repo = dataset["instances"][iid].get("repo", "unknown")
+            by_repo.setdefault(repo, []).append(iid)
+        selected_instances = [
+            iid for repo_ids in by_repo.values() for iid in repo_ids[:instances_per_repo]
+        ]
+        print(f"[Experiment] --instances-per-repo {instances_per_repo}: selected "
+              f"{len(selected_instances)} instance(s) across {len(by_repo)} repo(s)")
+    elif limit is not None:
         selected_instances = instance_ids[:limit]
         print(f"[Experiment] Running with --limit {limit}: first {len(selected_instances)} instances")
     else:
@@ -306,6 +333,7 @@ def run_experiment(
                 by_exit_reason[r.exit_reason] = by_exit_reason.get(r.exit_reason, 0) + 1
             instance_digests.append({
                 "instance_id": r.instance_id,
+                "repo_name": r.repo_name,
                 "status": r.status,
                 "stop_reason": r.stop_reason,
                 "exit_reason": r.exit_reason,
@@ -355,6 +383,9 @@ if __name__ == "__main__":
     parser.add_argument("--pure-python-only", action="store_true",
                          help="Only run repos that don't need C-extension builds (numpy/scipy/pandas/"
                               "matplotlib-style deps) -- cheaper/faster signal for early iteration")
+    parser.add_argument("--instances-per-repo", type=int, default=None,
+                         help="Select up to N instances from EACH repo (overrides --limit) -- e.g. "
+                              "1 to run a quick one-instance-per-repo pilot")
     args = parser.parse_args()
 
     result = run_experiment(
@@ -365,5 +396,6 @@ if __name__ == "__main__":
         run_name=args.run_name,
         repo_filter=args.repo_filter,
         pure_python_only=args.pure_python_only,
+        instances_per_repo=args.instances_per_repo,
     )
     print(json.dumps(result, indent=2))

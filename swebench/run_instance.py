@@ -139,8 +139,32 @@ def run_instance(
         start_time=start_time,
     )
 
+    # 5b. Bring in the reference tests (test_patch) BEFORE the agent starts,
+    # so its own run_tests calls -- and the loop's own "am I done" signal --
+    # can target the real FAIL_TO_PASS node ids instead of a generic
+    # test_command. These are just test names, not the solution; the gold
+    # fix patch itself is never applied or shown to the agent.
+    from swebench.utils import parse_test_id_list, apply_patch
+    fail_to_pass = parse_test_id_list(instance.get("FAIL_TO_PASS"))
+    pass_to_pass = parse_test_id_list(instance.get("PASS_TO_PASS"))
+    test_patch = instance.get("test_patch", "")
+    test_patch_applied = False
+    if test_patch:
+        try:
+            apply_patch(workspace_dir, test_patch)
+            test_patch_applied = True
+        except Exception as e:
+            result.status = "environment_error"
+            result.test_results = {"error": f"Failed to apply test_patch before agent run: {e}"}
+            result.end_time = time.time()
+            result.runtime = result.end_time - result.start_time
+            return result
+
     # 6. Let the agent modify the repository in the isolated workspace
-    agent_result = agent.solve(str(workspace_dir), task_description or instance.get("problem_statement", ""), test_command=test_cmd)
+    agent_result = agent.solve(
+        str(workspace_dir), task_description or instance.get("problem_statement", ""),
+        test_command=test_cmd, fail_to_pass_tests=fail_to_pass, pass_to_pass_tests=pass_to_pass,
+    )
 
     result.num_iterations = agent_result.num_iterations
     result.total_tool_calls = agent_result.total_tool_calls
@@ -171,7 +195,10 @@ def run_instance(
     # 9. Determine status: official FAIL_TO_PASS/PASS_TO_PASS evaluation
     if instance.get("FAIL_TO_PASS") or instance.get("PASS_TO_PASS"):
         from swebench.utils import evaluate_fail_to_pass
-        f2p = evaluate_fail_to_pass(workspace_dir, instance, timeout=60, python_bin=python_bin)
+        f2p = evaluate_fail_to_pass(
+            workspace_dir, instance, timeout=60, python_bin=python_bin,
+            test_patch_already_applied=test_patch_applied,
+        )
         result.status = f2p["status"]
         result.fail_to_pass_count = f2p["fail_to_pass_count"]
         result.fail_to_pass_total = f2p["fail_to_pass_total"]

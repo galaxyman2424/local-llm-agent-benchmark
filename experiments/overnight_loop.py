@@ -58,6 +58,8 @@ def overnight_loop(
     results_processed_dir: str = "results/processed/grid_search",
     force: bool = False,
     per_combo_safety_margin_seconds: float = 120.0,
+    repo_filter: str | None = None,
+    pure_python_only: bool = False,
 ) -> Path:
     """Run every reasoner x actioner combination once, skipping ones that
     already have a saved summary (unless --force), and stop BEFORE starting
@@ -119,6 +121,8 @@ def overnight_loop(
                 reasoner_model=reasoner_model,
                 actioner_model=actioner_model,
                 run_name=run_name,
+                repo_filter=repo_filter,
+                pure_python_only=pure_python_only,
             )
             _log({"event": "combo_done", "run_name": run_name,
                   "resolve_rate": summary.get("resolve_rate", 0.0),
@@ -222,6 +226,11 @@ if __name__ == "__main__":
     parser.add_argument("--until", type=str, default=None, help="Stop by this clock time, e.g. 07:00")
     parser.add_argument("--hours", type=float, default=None, help="Or: stop after this many hours from now")
     parser.add_argument("--force", action="store_true", help="Re-run combinations that already have a summary")
+    parser.add_argument("--repo-filter", type=str, default=None,
+                         help="Only run instances whose repo contains this substring, e.g. 'requests'")
+    parser.add_argument("--pure-python-only", action="store_true",
+                         help="Only run repos that don't need C-extension builds -- cheaper/faster "
+                              "signal for early iteration, good for overnight sanity runs")
     args = parser.parse_args()
 
     if args.until:
@@ -238,4 +247,6 @@ if __name__ == "__main__":
         limit=args.limit,
         deadline=deadline,
         force=args.force,
+        repo_filter=args.repo_filter,
+        pure_python_only=args.pure_python_only,
     )

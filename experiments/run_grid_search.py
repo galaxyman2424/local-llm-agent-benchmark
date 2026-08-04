@@ -50,6 +50,8 @@ def run_grid_search(
     results_raw_dir: str = "results/raw",
     results_processed_dir: str = "results/processed/grid_search",
     dry_run: bool = False,
+    repo_filter: str | None = None,
+    pure_python_only: bool = False,
 ) -> list[dict]:
     """Run (or preview) every reasoner x actioner combination.
 
@@ -70,6 +72,11 @@ def run_grid_search(
         total agent runs that implies) without actually running anything.
         Useful for sanity-checking models.txt and estimating runtime before
         committing to a potentially long grid search.
+    repo_filter, pure_python_only :
+        Passed straight through to :func:`run_experiment` -- lets you grid-
+        search reasoner/actioner combinations against a cheap, fast-
+        iterating subset of instances (e.g. skipping astropy/scikit-learn-
+        style C-extension builds) before committing to the full dataset.
 
     Returns
     -------
@@ -120,6 +127,8 @@ def run_grid_search(
                 reasoner_model=reasoner_model,
                 actioner_model=actioner_model,
                 run_name=run_name,
+                repo_filter=repo_filter,
+                pure_python_only=pure_python_only,
             )
         except Exception as e:
             print(f"[GridSearch] Combination {run_name} FAILED: {e}")
@@ -196,6 +205,11 @@ if __name__ == "__main__":
                          help="Number of instances to run per combination (recommended for an initial grid search)")
     parser.add_argument("--dry-run", action="store_true",
                          help="Just print the combinations that would run, without running them")
+    parser.add_argument("--repo-filter", type=str, default=None,
+                         help="Only run instances whose repo contains this substring, e.g. 'requests'")
+    parser.add_argument("--pure-python-only", action="store_true",
+                         help="Only run repos that don't need C-extension builds -- cheaper/faster "
+                              "signal for early iteration")
     args = parser.parse_args()
 
     run_grid_search(
@@ -203,4 +217,6 @@ if __name__ == "__main__":
         config_path=args.config,
         limit=args.limit,
         dry_run=args.dry_run,
+        repo_filter=args.repo_filter,
+        pure_python_only=args.pure_python_only,
     )
