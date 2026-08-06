@@ -1,0 +1,44 @@
+# Dockerfile.swebench-base
+#
+# Base image for running SWE-bench Lite instances in Docker.
+#
+# ensure_repo_environment() (swebench/utils.py) doesn't pin a different
+# Python version per repo -- _find_build_python() just picks the newest
+# available interpreter <= 3.11 on the host (because distutils, needed by
+# older C-extension packages, was removed in 3.12). So instead of a
+# per-repo Python-version matrix, this is just ONE image built on 3.11,
+# matching what the host-side venv approach already converges on.
+#
+# What actually varies per repo is each package's OWN build requirements
+# (numpy/Cython versions, etc, from its pyproject.toml) -- that's handled
+# dynamically at repo-image build time by container_env_setup.py, not
+# baked into this base image.
+
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System build deps for the C-extension-heavy repos in SWE-bench Lite
+# (numpy, scipy, matplotlib, lxml-style packages). Broad on purpose --
+# _diagnose_build_failure() in utils.py already tells you which of these
+# was missing on the host; installing all of them up front here means you
+# never hit that message again inside a container.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gfortran \
+    git \
+    pkg-config \
+    libssl-dev \
+    libffi-dev \
+    libjpeg-dev \
+    libfreetype6-dev \
+    libpng-dev \
+    libopenblas-dev \
+    liblapack-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip
+
+WORKDIR /workspace

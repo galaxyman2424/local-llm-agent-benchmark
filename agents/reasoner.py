@@ -53,7 +53,7 @@ class Reasoner:
         self,
         *,
         model_id: str = "qwen3.5:9b",
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float = 240.0,
         num_ctx: int = DEFAULT_NUM_CTX,
     ):
         self.model_id = model_id

@@ -225,6 +225,57 @@ class Agent:
                     break
 
             is_valid, error = validate_action(action)
+
+            # 4. Loop detection: same tool+parameters repeated too often.
+            #
+            # IMPORTANT: this must run BEFORE the cached-read/cached-listing
+            # short-circuits below. Those short-circuits `continue` the loop
+            # for read_file/list_directory calls that hit the cache -- if
+            # loop detection ran after them, a model stuck alternating
+            # between two already-cached reads would never update
+            # action_key/repeated_action_count/action_window at all, since
+            # every one of those calls would exit via `continue` first. That
+            # made cache-hit loops (e.g. re-reading the same file range over
+            # and over) completely invisible to this detector, letting them
+            # burn the full iteration budget instead of being caught.
+            action_key = (action.get("tool"), _stable_repr(action.get("parameters", {})))
+            if action_key == last_action_key:
+                repeated_action_count += 1
+            else:
+                repeated_action_count = 0
+            last_action_key = action_key
+            last_action_tuple = action_key
+
+            if repeated_action_count >= MAX_REPEATED_ACTIONS:
+                print("[Agent] Same action repeated too many times without progress; stopping.")
+                stop_reason = "repeated_action"
+                exit_reason = "repeated_action"
+                break
+
+            # Detect A-B-A-B style oscillation, not just immediate repeats.
+            #
+            # NOTE: period=1 is deliberately excluded here. window[-1:] ==
+            # window[-2:-1] for period=1 is exactly the same condition as
+            # action_key == last_action_key above -- but it used to run in
+            # this same loop over periods (1, 2, 3), which meant it fired on
+            # the very first repeat (repeated_action_count == 1) instead of
+            # waiting for MAX_REPEATED_ACTIONS in a row. That made the
+            # MAX_REPEATED_ACTIONS=4 threshold unreachable in practice: any
+            # single exact repeat killed the run immediately via this
+            # oscillation check before the counter above could ever reach 4.
+            action_window.append(action_key)
+            window = list(action_window)
+            cycle_detected = False
+            for period in (2, 3):
+                if len(window) >= period * 2 and window[-period:] == window[-2 * period:-period]:
+                    cycle_detected = True
+                    break
+            if cycle_detected:
+                print("[Agent] Detected oscillating action cycle; stopping.")
+                stop_reason = "repeated_action"
+                exit_reason = "repeated_action"
+                break
+
             if _is_cached_read(current_state, action):
                 path = (action.get("parameters") or {}).get("path")
 
@@ -292,35 +343,6 @@ class Agent:
                 })
 
                 continue
-
-            # 4. Loop detection: same tool+parameters repeated too often
-            action_key = (action.get("tool"), _stable_repr(action.get("parameters", {})))
-            if action_key == last_action_key:
-                repeated_action_count += 1
-            else:
-                repeated_action_count = 0
-            last_action_key = action_key
-            last_action_tuple = action_key
-
-            if repeated_action_count >= MAX_REPEATED_ACTIONS:
-                print("[Agent] Same action repeated too many times without progress; stopping.")
-                stop_reason = "repeated_action"
-                exit_reason = "repeated_action"
-                break
-
-            # NEW: detect A-B-A-B style oscillation, not just immediate repeats
-            action_window.append(action_key)
-            window = list(action_window)
-            cycle_detected = False
-            for period in (1, 2, 3):
-                if len(window) >= period * 2 and window[-period:] == window[-2 * period:-period]:
-                    cycle_detected = True
-                    break
-            if cycle_detected:
-                print("[Agent] Detected oscillating action cycle; stopping.")
-                stop_reason = "repeated_action"
-                exit_reason = "repeated_action"
-                break
 
             # 5. Execute the concrete tool call (deterministic)
             try:

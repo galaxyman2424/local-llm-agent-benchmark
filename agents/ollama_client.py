@@ -40,6 +40,7 @@ class OllamaClient:
         Uses ``self.base_url`` (not the class-level default) so a client
         constructed with a custom ``base_url`` actually talks to that host.
         """
+        import http.client
         import urllib.error
         import urllib.request
 
@@ -50,8 +51,28 @@ class OllamaClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                return json.loads(resp.read())
-        except urllib.error.URLError as e:
+                raw = resp.read()
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as e:
+                # A malformed/truncated body (e.g. a connection that dropped
+                # mid-response) isn't a URLError -- it's a ValueError from
+                # json.loads -- so it must be caught and wrapped here too,
+                # or it propagates uncaught past every layer above that
+                # only expects RuntimeError (see Reasoner._call_model).
+                snippet = raw[:200].decode("utf-8", errors="replace") if raw else "<empty body>"
+                raise RuntimeError(
+                    f"Ollama returned a non-JSON/truncated response from {url}: {e} "
+                    f"(body started with: {snippet!r})"
+                ) from e
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as e:
+            # TimeoutError/ConnectionError/http.client.HTTPException cover
+            # failures that can occur mid-read (e.g. a slow cold model load
+            # exceeding the timeout, or a dropped connection while streaming
+            # the response) -- these are NOT urllib.error.URLError and were
+            # previously left uncaught, so they escaped every downstream
+            # "except RuntimeError" handler and surfaced as unexplained,
+            # undiagnosed errors with no instance record at all.
             raise RuntimeError(f"Failed to reach Ollama at {url}: {e}") from e
 
     # ------------------------------------------------------------------

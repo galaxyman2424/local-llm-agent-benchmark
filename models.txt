@@ -13,6 +13,17 @@
 # configs/single_model.yaml) -- experiments/run_grid_search.py will still
 # pair it with itself as one combination.
 #
+#
+#   llama3.1:8b-instruct-q4_K_M
+#   lfm2.5:8b
+#   phi4-mini:latest
+#   deepseek-r1:7b-qwen-distill-q4_K_M
+#   hermes3:8b
+#
+#
+#  qwen2.5-coder:3b-instruct-q4_K_M
+#  deepseek-r1:7b-qwen-distill-q4_K_M
+#  qwen3.5:9b
 # IMPORTANT: this starting list only includes the models already referenced
 # elsewhere in this project (configs/*.yaml, README.md). It does NOT know
 # what you actually have pulled locally. Before running the grid search,
@@ -26,14 +37,7 @@
 
 [reasoners]
 qwen3.5:9b
-hermes3:8b
-llama3.1:8b-instruct-q4_K_M
-lfm2.5:8b
-phi4-mini:latest
-deepseek-r1:7b-qwen-distill-q4_K_M
+
 
 [actioners]
 ornith:9b
-qwen2.5-coder:3b-instruct-q4_K_M
-deepseek-r1:7b-qwen-distill-q4_K_M
-qwen3.5:9b
