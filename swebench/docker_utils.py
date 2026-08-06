@@ -36,6 +36,9 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
+
+from .utils import apply_patch, parse_test_id_list
 
 DOCKER_BASE_IMAGE = "swebench-base:latest"  # built via build_base_image.sh
 _THIS_DIR = Path(__file__).parent  # .../docker_setup/swebench/
@@ -174,3 +177,84 @@ def ensure_repo_environment_docker(
     container_name = f"swebench-{instance_id.replace('/', '_')}"
     start_instance_container(image_tag, instance_workspace_dir, container_name)
     return "python3", container_name
+
+
+def run_test_ids_in_container(
+    container_name: str,
+    test_ids: list[str],
+    timeout: float = 60.0,
+    python_bin: str = "python3",
+) -> dict[str, bool | None]:
+    """Container-routed equivalent of utils.py's run_test_ids() -- same
+    per-test-id, return-code-only approach, just executed via `docker exec`
+    instead of a host subprocess.run().
+    """
+    results: dict[str, bool | None] = {}
+    for test_id in test_ids:
+        cmd = f"{python_bin} -m pytest -q {shlex.quote(test_id)}"
+        try:
+            proc = exec_in_container(container_name, cmd, timeout_seconds=timeout)
+            results[test_id] = proc.returncode == 0
+        except RuntimeError:
+            results[test_id] = None
+    return results
+
+
+def evaluate_fail_to_pass_in_container(
+    container_name: str,
+    instance: dict[str, Any],
+    workspace_dir: str | Path,
+    timeout: float = 60.0,
+    python_bin: str = "python3",
+    test_patch_already_applied: bool = False,
+) -> dict[str, Any]:
+    """Container-routed equivalent of utils.py's evaluate_fail_to_pass().
+
+    apply_patch() itself stays host-side and unmodified: it's a `git apply`
+    against workspace_dir, which is the same directory bind-mounted into
+    the container, so the patch is visible on both sides regardless of
+    where the git command runs.
+    """
+    fail_to_pass = parse_test_id_list(instance.get("FAIL_TO_PASS"))
+    pass_to_pass = parse_test_id_list(instance.get("PASS_TO_PASS"))
+
+    test_patch = instance.get("test_patch", "")
+    if test_patch and not test_patch_already_applied:
+        try:
+            apply_patch(workspace_dir, test_patch)
+        except Exception as e:
+            return {
+                "status": "patch_failure",
+                "error": f"Failed to apply test_patch: {e}",
+                "fail_to_pass_results": {}, "pass_to_pass_results": {},
+                "fail_to_pass_count": 0, "pass_to_pass_count": 0,
+                "fail_to_pass_total": len(fail_to_pass), "pass_to_pass_total": len(pass_to_pass),
+            }
+
+    fail_to_pass_results = run_test_ids_in_container(container_name, fail_to_pass, timeout, python_bin)
+    pass_to_pass_results = run_test_ids_in_container(container_name, pass_to_pass, timeout, python_bin)
+
+    fail_to_pass_count = sum(1 for v in fail_to_pass_results.values() if v is True)
+    pass_to_pass_count = sum(1 for v in pass_to_pass_results.values() if v is True)
+
+    all_results = {**fail_to_pass_results, **pass_to_pass_results}
+    timed_out = any(v is None for v in all_results.values())
+
+    if timed_out:
+        status = "timeout"
+    elif not fail_to_pass and not pass_to_pass:
+        status = "not_resolved"
+    elif fail_to_pass_count == len(fail_to_pass) and pass_to_pass_count == len(pass_to_pass):
+        status = "resolved"
+    else:
+        status = "not_resolved"
+
+    return {
+        "status": status,
+        "fail_to_pass_results": fail_to_pass_results,
+        "pass_to_pass_results": pass_to_pass_results,
+        "fail_to_pass_count": fail_to_pass_count,
+        "pass_to_pass_count": pass_to_pass_count,
+        "fail_to_pass_total": len(fail_to_pass),
+        "pass_to_pass_total": len(pass_to_pass),
+    }

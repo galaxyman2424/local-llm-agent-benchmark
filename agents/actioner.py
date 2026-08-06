@@ -37,7 +37,8 @@ class Actioner:
 
 class Actioner:
     def __init__(self, model_id="ornith:9b", workspace_dir=None, timeout_seconds=120.0,
-             num_ctx=DEFAULT_NUM_CTX, max_read_lines=300, python_bin: str | None = None):
+             num_ctx=DEFAULT_NUM_CTX, max_read_lines=300, python_bin: str | None = None,
+             container_name: str | None = None):
         """``timeout_seconds`` is the max time for a single Ollama request
         (the Actioner's translate-plan-to-tool-call call), independent of
         the agent's overall per-task timeout configured elsewhere.
@@ -46,6 +47,14 @@ class Actioner:
         returns (see `execute`'s read_file branch) -- keep this in step
         with the model's num_ctx: a bigger context window can afford a
         bigger visible slice per read.
+
+        ``container_name`` -- when set, run_command/run_tests execute
+        inside this Docker container (via docker_utils.exec_in_container)
+        instead of subprocess.run() on the host. File-editing tools
+        (read_file, replace_lines, write_to_file, etc.) are unaffected --
+        they operate on workspace_dir directly, which is the same
+        directory bind-mounted into the container, so host-side file
+        operations against it are already correct in both modes.
         """
         self.model_id = model_id
         self.workspace_dir = workspace_dir or "."
@@ -53,6 +62,7 @@ class Actioner:
         self.num_ctx = num_ctx
         self.max_read_lines = max_read_lines
         self.python_bin = python_bin
+        self.container_name = container_name
         self.client = OllamaClient(
             model=model_id,
             timeout_seconds=timeout_seconds,
@@ -301,6 +311,13 @@ class Actioner:
 
             elif tool_name == "run_command":
                 command = self._use_venv_python(params.get("command", ""))
+                if self.container_name:
+                    from swebench.docker_utils import exec_in_container
+                    try:
+                        result = exec_in_container(self.container_name, command, timeout_seconds=120.0)
+                    except RuntimeError as e:
+                        return {"tool": tool_name, "error": str(e), "returncode": None}
+                    return {"tool": tool_name, "result": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
                 import subprocess
                 try:
                     result = subprocess.run(
@@ -313,6 +330,13 @@ class Actioner:
 
             elif tool_name == "run_tests":
                 test_command = self._use_venv_python(params.get("command", "pytest --tb=short"))
+                if self.container_name:
+                    from swebench.docker_utils import exec_in_container
+                    try:
+                        result = exec_in_container(self.container_name, test_command, timeout_seconds=300.0)
+                    except RuntimeError as e:
+                        return {"tool": tool_name, "error": str(e), "returncode": None}
+                    return {"tool": tool_name, "result": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
                 import subprocess
                 try:
                     result = subprocess.run(
