@@ -52,6 +52,7 @@ def run_grid_search(
     dry_run: bool = False,
     repo_filter: str | None = None,
     pure_python_only: bool = False,
+    use_docker: bool = False,
 ) -> list[dict]:
     """Run (or preview) every reasoner x actioner combination.
 
@@ -129,6 +130,7 @@ def run_grid_search(
                 run_name=run_name,
                 repo_filter=repo_filter,
                 pure_python_only=pure_python_only,
+                use_docker=use_docker,
             )
         except Exception as e:
             print(f"[GridSearch] Combination {run_name} FAILED: {e}")
@@ -210,6 +212,8 @@ if __name__ == "__main__":
     parser.add_argument("--pure-python-only", action="store_true",
                          help="Only run repos that don't need C-extension builds -- cheaper/faster "
                               "signal for early iteration")
+    parser.add_argument("--docker", action="store_true",
+                         help="Run each instance's repo environment in Docker instead of a host venv")
     args = parser.parse_args()
 
     run_grid_search(
@@ -219,4 +223,5 @@ if __name__ == "__main__":
         dry_run=args.dry_run,
         repo_filter=args.repo_filter,
         pure_python_only=args.pure_python_only,
+        use_docker=args.docker,
     )

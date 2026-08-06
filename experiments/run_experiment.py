@@ -86,6 +86,7 @@ def run_experiment(
     repo_filter: str | None = None,
     pure_python_only: bool = False,
     instances_per_repo: int | None = None,
+    use_docker: bool = False,
 ) -> dict:
     """Run a complete experiment based on the given config.
 
@@ -147,6 +148,12 @@ def run_experiment(
         whether failures are repo-specific (environment issues) or
         model-specific (small-model reasoning/context limits) before
         committing to a full run. See ``experiments/pilot_run.py``.
+    use_docker : bool
+        If True, each instance's repo environment runs in a per-repo
+        Docker container (see ``swebench/docker_utils.py``) instead of a
+        host venv -- all test execution routes through it too (the
+        agent's own run_tests calls, its live FAIL_TO_PASS check, and the
+        two evaluation steps in ``SWEbenchBenchmark.run_instance``).
 
     Returns
     -------
@@ -280,6 +287,7 @@ def run_experiment(
                 agent=agent,
                 reasoner_model=reasoner_model,
                 actioner_model=actioner_model,
+                use_docker=use_docker,
             )
             results.append(result)
             print(f"[Experiment] Instance {instance_id}: status={result.status}")
@@ -386,6 +394,9 @@ if __name__ == "__main__":
     parser.add_argument("--instances-per-repo", type=int, default=None,
                          help="Select up to N instances from EACH repo (overrides --limit) -- e.g. "
                               "1 to run a quick one-instance-per-repo pilot")
+    parser.add_argument("--docker", action="store_true",
+                         help="Run each instance's repo environment in Docker instead of a host venv "
+                              "(see swebench/docker_utils.py)")
     args = parser.parse_args()
 
     result = run_experiment(
@@ -397,5 +408,6 @@ if __name__ == "__main__":
         repo_filter=args.repo_filter,
         pure_python_only=args.pure_python_only,
         instances_per_repo=args.instances_per_repo,
+        use_docker=args.docker,
     )
     print(json.dumps(result, indent=2))

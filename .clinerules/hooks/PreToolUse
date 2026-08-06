@@ -12,6 +12,7 @@ input=$(cat)
 tool_name=$(echo "$input" | grep -o '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)"/\1/')
 command_str=$(echo "$input" | grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)"/\1/')
 file_path=$(echo "$input" | grep -oE '"(path|file_path)"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)"/\1/')
+cwd_field=$(echo "$input" | grep -oE '"cwd"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:"([^"]*)"/\1/')
 
 # 1. Never let Cline hand-edit results/raw/ -- it's append-only experimental
 #    record per 03-project-conventions.md.
@@ -28,7 +29,20 @@ if [[ "$file_path" == *"seed_repos/"*"/repos/"* ]] || [[ "$file_path" == *"seed_
   exit 0
 fi
 
-# 3. Warn (but do not block) on a full, unlimited benchmark run.
+# 3. When Cline touches the Agent-loop's read_file implementation, surface
+#    the already-diagnosed line-range bug so it doesn't have to rediscover
+#    it from scratch: read_file currently accepts start_line/end_line but
+#    doesn't apply them to the returned slice, so it keeps returning the
+#    same truncated ~300-line view no matter what range is requested. This
+#    is why nested-CompoundModel logic near the end of separable.py (past
+#    line 300) was never actually visible to the benchmarked agent in the
+#    astropy-12907 trace -- not a reasoning failure, a tool bug.
+if [[ "$file_path" == *"tool_schemas.py"* ]] || [[ "$file_path" == *"read_file"* ]]; then
+  echo '{"cancel": false, "contextModification": "Heads up: read_file has a known bug where start_line/end_line are accepted but not applied to the returned slice -- it always returns the same truncated view regardless of the requested range, silently hiding content past the truncation point from the agent. If you are touching this function, check the slicing logic against the requested offsets, and add a regression test that reads a file >300 lines with a start_line beyond the first page to confirm the fix actually changes the output."}'
+  exit 0
+fi
+
+# 4. Warn (but do not block) on a full, unlimited benchmark run.
 if [[ "$command_str" == *"run_experiment.py"* ]] && [[ "$command_str" != *"--limit"* ]]; then
   echo '{"cancel": true, "errorMessage": "This looks like a full, unlimited benchmark run (no --limit). Per ACTIONPLAN.md section 14, verify with --limit 1, then --limit 5/10 first. Re-run with --limit if you really mean to run everything, or ask the user to confirm an unlimited run explicitly."}'
   exit 0
@@ -39,13 +53,63 @@ if [[ "$command_str" == *"run_grid_search.py"* ]] && [[ "$command_str" != *"--dr
   exit 0
 fi
 
-# 4. Block obviously destructive commands anywhere in the repo.
+# 5. Require a verified environment-build marker before letting a test
+#    command run against a cloned SWE-bench repo. This targets the
+#    "ImportError: ... without building the extension modules first"
+#    failure mode directly: instead of letting Cline run pytest, watch it
+#    fail with a confusing collection error, and re-diagnose from scratch
+#    (as qwen3.5:9b did across 6 wasted iterations in the astropy-12907
+#    trace), we gate the run on a marker file that setup_repo()/
+#    ensure_repo_environment is expected to touch once the build actually
+#    succeeds. NOTE: this requires that build step to create
+#    <repo_root>/.env_ready on success -- if nothing ever touches that
+#    marker, this check will block pytest forever. See ACTIONPLAN.md
+#    "environment setup" section.
+is_test_command() {
+  local s="$1"
+  [[ "$s" =~ (^|[^a-zA-Z0-9_/.-])(pytest|py\.test)([^a-zA-Z0-9_-]|$) ]] && return 0
+  [[ "$s" =~ python3?[[:space:]]+-m[[:space:]]+pytest ]] && return 0
+  [[ "$s" =~ (^|[[:space:]])tox([[:space:]]|$) ]] && return 0
+  return 1
+}
+
+is_build_command() {
+  local s="$1"
+  [[ "$s" == *"pip install -e ."* ]] && return 0
+  [[ "$s" == *"build_ext"* ]] && return 0
+  [[ "$s" == *"setup_repo"* ]] && return 0
+  [[ "$s" == *"ensure_repo_environment"* ]] && return 0
+  return 1
+}
+
+cd_in_cmd=$(echo "$command_str" | grep -oE 'cd[[:space:]]+[^&;]+' | head -1 | sed -E 's/^cd[[:space:]]+//')
+
+candidate_path=""
+for p in "$file_path" "$cwd_field" "$cd_in_cmd" "$command_str"; do
+  if [[ "$p" == *"seed_repos/"*"/repos/"* ]]; then
+    candidate_path="$p"
+    break
+  fi
+done
+
+if [[ -n "$candidate_path" ]] && is_test_command "$command_str" && ! is_build_command "$command_str"; then
+  repo_root=$(echo "$candidate_path" | grep -oE '.*seed_repos/[^/]+/repos/[^/]+' | head -1)
+  if [[ -n "$repo_root" ]]; then
+    marker="$repo_root/.env_ready"
+    if [[ ! -f "$marker" ]]; then
+      echo "{\"cancel\": true, \"errorMessage\": \"No .env_ready marker found at $marker, meaning this repo's environment (e.g. compiled C extensions) may never have been built. Running the test command now is likely to fail with an unbuilt-extensions ImportError rather than give a real test result. Run the repo's build/install step first -- setup_repo()/ensure_repo_environment, or 'pip install -e . --no-build-isolation' -- which should create $marker on success, then re-run the test command.\"}"
+      exit 0
+    fi
+  fi
+fi
+
+# 6. Block obviously destructive commands anywhere in the repo.
 if [[ "$command_str" =~ rm[[:space:]]+-rf[[:space:]]+(/|\.\.|seed_repos[^/]*$) ]]; then
   echo '{"cancel": true, "errorMessage": "Blocked a broad recursive delete. Scope the rm -rf to a specific instance/workspace subdirectory instead."}'
   exit 0
 fi
 
-# 5. Overnight code-improvement loop guardrails (see
+# 7. Overnight code-improvement loop guardrails (see
 #    overnight-code-improvement-loop.md): never push, merge, or commit
 #    directly to main/master, regardless of what an unattended loop decides
 #    is a good idea at 3am.

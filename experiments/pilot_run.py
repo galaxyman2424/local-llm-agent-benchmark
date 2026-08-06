@@ -50,6 +50,7 @@ def pilot_run(
     results_processed_dir: str = "results/processed/pilot",
     repo_filter: str | None = None,
     pure_python_only: bool = True,
+    use_docker: bool = False,
 ) -> dict:
     """Run the pilot and return the aggregated diagnostic report (also
     printed and saved to ``results_processed_dir/PILOT_REPORT.json``).
@@ -88,6 +89,7 @@ def pilot_run(
                 repo_filter=repo_filter,
                 pure_python_only=pure_python_only,
                 instances_per_repo=instances_per_repo,
+                use_docker=use_docker,
             )
         except Exception as e:
             print(f"[Pilot] Combination {run_name} CRASHED: {e}")
@@ -205,6 +207,8 @@ if __name__ == "__main__":
                          help="Only run instances whose repo contains this substring, e.g. 'requests'")
     parser.add_argument("--all-repos", action="store_true",
                          help="Include repos that need C-extension builds too (default: pure-Python only)")
+    parser.add_argument("--docker", action="store_true",
+                         help="Run each instance's repo environment in Docker instead of a host venv")
     args = parser.parse_args()
 
     pilot_run(
@@ -213,4 +217,5 @@ if __name__ == "__main__":
         instances_per_repo=args.instances_per_repo,
         repo_filter=args.repo_filter,
         pure_python_only=not args.all_repos,
+        use_docker=args.docker,
     )

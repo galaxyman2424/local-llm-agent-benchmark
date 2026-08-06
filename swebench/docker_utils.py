@@ -49,25 +49,28 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
-def image_tag_for_repo(repo_name: str) -> str:
-    safe = repo_name.replace("/", "__").lower()
-    return f"swebench-repo-{safe}:latest"
+def image_tag_for_repo(repo_name: str, python_version: str) -> str:
+    safe_name = repo_name.replace("/", "__")
+    return f"swebench-repo-{safe_name}:py{python_version}"
 
-
-def build_repo_image(repo_name: str, repo_source_dir: str | Path, force_rebuild: bool = False) -> str:
+def build_repo_image(
+    repo_name: str,
+    repo_source_dir: str | Path,
+    force_rebuild: bool = False,
+    python_version: str | None = None,
+) -> str:
     """Build (or reuse) a Docker image for one repo.
-
-    repo_source_dir: the shared cloned repo (same directory
-    ensure_repo_environment() would build a venv next to) -- NOT a
-    per-instance workspace. This mirrors "build once per repo, reuse across
-    instances of that repo."
-
-    force_rebuild: set True to rebuild even if a cached image with this tag
-    already exists -- e.g. after the repo checkout has changed, the same
-    case that makes ensure_repo_environment() detect staleness and rebuild
-    its venv.
+    ...
+    python_version: e.g. "3.9" -- selects the base image's Python so old
+    C-extension repos build against a compatible interpreter/toolchain
+    (see get_python_version() in repo_python_versions.py). Falls back to
+    DOCKER_BASE_IMAGE if not provided, for backward compatibility.
     """
-    tag = image_tag_for_repo(repo_name)
+    if python_version is None:
+        from swebench.repo_python_versions import get_python_version
+        python_version = get_python_version(repo_name)
+
+    tag = image_tag_for_repo(repo_name, python_version)  # see below -- must include version
     repo_source_dir = Path(repo_source_dir)
 
     if not force_rebuild:
@@ -76,18 +79,18 @@ def build_repo_image(repo_name: str, repo_source_dir: str | Path, force_rebuild:
             print(f"[docker] Reusing cached image {tag}")
             return tag
 
-    # Build context needs the repo itself, plus utils.py and
-    # container_env_setup.py so the install step can import the real
-    # helper functions instead of duplicating their logic. Docker can't
-    # COPY from outside the build context, so stage them into a temp
-    # subdirectory of the repo checkout, build from there, then clean up.
     staging_utils = repo_source_dir / "_docker_stage_utils.py"
     staging_setup = repo_source_dir / "_docker_stage_container_env_setup.py"
     shutil.copy(_THIS_DIR / "utils.py", staging_utils)
     shutil.copy(_THIS_DIR.parent / "docker" / "container_env_setup.py", staging_setup)
 
+    base_image = f"python:{python_version}-slim-bullseye"
+
     dockerfile = f"""
-FROM {DOCKER_BASE_IMAGE}
+FROM {base_image}
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    build-essential git \\
+    && rm -rf /var/lib/apt/lists/*
 COPY . /workspace/repo
 COPY _docker_stage_utils.py /workspace/utils.py
 COPY _docker_stage_container_env_setup.py /workspace/container_env_setup.py
@@ -108,7 +111,16 @@ RUN python3 /workspace/container_env_setup.py
         dockerfile_path.unlink(missing_ok=True)
 
     if result.returncode != 0:
-        raise RuntimeError(f"Failed to build Docker image for {repo_name}:\n{result.stderr[-3000:]}")
+        stdout_lines = result.stdout.splitlines() if result.stdout else []
+        stderr_lines = result.stderr.splitlines() if result.stderr else []
+        
+        combined_output = (
+            "\n".join(f"[STDOUT] {line}" for line in stdout_lines)
+            + "\n[STDERR]\n"
+            + "\n".join("  " + line for line in stderr_lines)
+        )[:6000]
+
+        raise RuntimeError(f"Failed to build Docker image for {repo_name}:\n{combined_output}")
     print(f"[docker] Built image {tag}")
     return tag
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+import os
 
 # utils.py is COPY'd in next to this script (see build_repo_image()).
 sys.path.insert(0, str(Path(__file__).parent))
@@ -30,15 +31,22 @@ _last_failure_output = ""
 
 def _pip(*args: str) -> bool:
     global _last_failure_output
+    env = os.environ.copy()
+    env["CFLAGS"] = env.get("CFLAGS", "") + " -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration"
     proc = subprocess.run(
         [sys.executable, "-m", "pip", *args],
         cwd=str(REPO_DIR),
         capture_output=True,
         text=True,
+        env=env,
     )
     if proc.returncode != 0:
-        _last_failure_output = proc.stderr + proc.stdout
-        print(f"[container-env] pip {' '.join(args)} failed:\n{proc.stderr[-2000:]}")
+        full = proc.stderr + proc.stdout
+        _last_failure_output = full
+        # Try to find the actual compiler error line(s), not just the tail
+        error_lines = [l for l in full.splitlines() if "error:" in l.lower() or "fatal error" in l.lower()]
+        snippet = "\n".join(error_lines[-15:]) if error_lines else full[-2000:]
+        print(f"[container-env] pip {' '.join(args)} failed:\n{snippet}")
         return False
     return True
 
@@ -74,7 +82,7 @@ def main() -> None:
     #    everything installed above instead of building in a fresh
     #    pyproject.toml-only environment (which would reintroduce the
     #    exact setuptools problem step 2 just fixed).
-    install_ok = _pip("install", "-q", "--no-build-isolation", "-e", ".")
+    install_ok = _pip("install", "--no-build-isolation", "-e", ".", "-v")
 
     if not install_ok:
         hint = _diagnose_build_failure(_last_failure_output, Path(sys.executable))

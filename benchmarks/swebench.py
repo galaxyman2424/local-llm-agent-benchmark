@@ -107,8 +107,16 @@ class SWEbenchBenchmark:
         agent,
         reasoner_model: str | None = None,
         actioner_model: str | None = None,
+        use_docker: bool = False,
     ) -> InstanceRecord:
-        """Run one SWE-bench instance through the full pipeline."""
+        """Run one SWE-bench instance through the full pipeline.
+
+        use_docker: when True, the repo's dependencies are installed into a
+        per-repo Docker image/container (see swebench/docker_utils.py)
+        instead of a host venv, and all test execution (the agent's own
+        run_tests calls, the live FAIL_TO_PASS check inside Agent.solve,
+        and the two evaluation steps below) route through that container.
+        """
         repo_name = task.get("repo", "unknown")
         base_commit = task.get("base_commit", "")
 
@@ -128,94 +136,132 @@ class SWEbenchBenchmark:
         #    regardless of what the agent did).
         record.start_time = start
         repo_path = self.setup_repo(repo_name, base_commit)
-        from swebench.utils import ensure_repo_environment
-        python_bin, install_ok = ensure_repo_environment(repo_path)
+
+        container_name = None
+        if use_docker:
+            from swebench.docker_utils import ensure_repo_environment_docker
+            try:
+                python_bin, container_name = ensure_repo_environment_docker(
+                    repo_name, repo_path, task.get("instance_id", repo_name), repo_path,
+                )
+                install_ok = True
+            except RuntimeError as e:
+                record.status = "environment_error"
+                record.test_results = {"error": f"Docker environment setup failed: {e}"}
+                record.end_time = time.time()
+                record.runtime = record.end_time - record.start_time
+                return record
+        else:
+            from swebench.utils import ensure_repo_environment
+            python_bin, install_ok = ensure_repo_environment(repo_path)
 
         task_text = task.get("task_description") or task.get("problem_statement", "")
         test_cmd = task.get("test_command", "pytest")
 
-        # Bring in the reference tests (test_patch) BEFORE the agent starts,
-        # so its own run_tests calls can target the real FAIL_TO_PASS node
-        # ids -- these are just test names, not the solution, so there's no
-        # reason to withhold them. The gold fix itself (`patch`) is never
-        # applied or shown to the agent.
-        from swebench.utils import parse_test_id_list, apply_patch
-        fail_to_pass = parse_test_id_list(task.get("FAIL_TO_PASS"))
-        pass_to_pass = parse_test_id_list(task.get("PASS_TO_PASS"))
-        test_patch = task.get("test_patch", "")
-        test_patch_applied = False
-        if test_patch:
-            try:
-                apply_patch(repo_path, test_patch)
-                test_patch_applied = True
-            except Exception as e:
+        try:
+            # Bring in the reference tests (test_patch) BEFORE the agent starts,
+            # so its own run_tests calls can target the real FAIL_TO_PASS node
+            # ids -- these are just test names, not the solution, so there's no
+            # reason to withhold them. The gold fix itself (`patch`) is never
+            # applied or shown to the agent.
+            from swebench.utils import parse_test_id_list, apply_patch
+            fail_to_pass = parse_test_id_list(task.get("FAIL_TO_PASS"))
+            pass_to_pass = parse_test_id_list(task.get("PASS_TO_PASS"))
+            test_patch = task.get("test_patch", "")
+            test_patch_applied = False
+            if test_patch:
+                try:
+                    apply_patch(repo_path, test_patch)
+                    test_patch_applied = True
+                except Exception as e:
+                    record.status = "environment_error"
+                    record.test_results = {"error": f"Failed to apply test_patch before agent run: {e}"}
+                    record.end_time = time.time()
+                    record.runtime = record.end_time - record.start_time
+                    return record
+
+            agent_result = agent.solve(
+                str(repo_path), task_text, test_command=test_cmd, python_bin=python_bin,
+                fail_to_pass_tests=fail_to_pass, pass_to_pass_tests=pass_to_pass,
+                container_name=container_name,
+            )
+
+            record.exit_reason = getattr(agent_result, "exit_reason", "") or ""
+            record.stop_reason = getattr(agent_result, "stop_reason", "") or ""
+            record.last_action = getattr(agent_result, "last_action", {}) or {}
+            record.last_result = getattr(agent_result, "last_result", {}) or {}
+            record.last_reasoner_plan = getattr(agent_result, "last_reasoner_plan", {}) or {}
+            record.history = getattr(agent_result, "history", []) or []
+            record.num_iterations = getattr(agent_result, "num_iterations", 0) or 0
+            record.total_tool_calls = getattr(agent_result, "total_tool_calls", 0) or 0
+            record.final_patch = getattr(agent_result, "final_patch", "") or ""
+
+            if not install_ok:
+                # Environment setup genuinely failed -- running tests would
+                # just fail for everything regardless of the agent, wasting a
+                # lot of time across many instances. Mark it distinctly rather
+                # than letting it masquerade as "the agent didn't fix the bug".
                 record.status = "environment_error"
-                record.test_results = {"error": f"Failed to apply test_patch before agent run: {e}"}
+                record.test_results = {"error": "repo dependency installation failed; see .swebench_venv/pip_install.log"}
                 record.end_time = time.time()
                 record.runtime = record.end_time - record.start_time
                 return record
 
-        agent_result = agent.solve(
-            str(repo_path), task_text, test_command=test_cmd, python_bin=python_bin,
-            fail_to_pass_tests=fail_to_pass, pass_to_pass_tests=pass_to_pass,
-        )
+            # 2. Run tests on the patched repo, using the repo's own venv
+            #    (or, in Docker mode, the repo's container).
+            if use_docker:
+                from swebench.docker_utils import exec_in_container
+                proc = exec_in_container(container_name, f"{python_bin} -m pytest --tb=short", timeout_seconds=60.0)
+            else:
+                proc = __import__("subprocess").run(
+                    [python_bin, "-m", "pytest", "--tb=short"],
+                    cwd=str(repo_path),
+                    capture_output=True, text=True, timeout=60,
+                )
+            record.test_results = {
+                "command": f"{python_bin} -m pytest",
+                "returncode": proc.returncode,
+                "stdout": proc.stdout[:500],
+                "stderr": proc.stderr[:500],
+            }
 
-        record.exit_reason = getattr(agent_result, "exit_reason", "") or ""
-        record.stop_reason = getattr(agent_result, "stop_reason", "") or ""
-        record.last_action = getattr(agent_result, "last_action", {}) or {}
-        record.last_result = getattr(agent_result, "last_result", {}) or {}
-        record.last_reasoner_plan = getattr(agent_result, "last_reasoner_plan", {}) or {}
-        record.history = getattr(agent_result, "history", []) or []
-        record.num_iterations = getattr(agent_result, "num_iterations", 0) or 0
-        record.total_tool_calls = getattr(agent_result, "total_tool_calls", 0) or 0
-        record.final_patch = getattr(agent_result, "final_patch", "") or ""
-        
-        if not install_ok:
-            # Environment setup genuinely failed -- running tests would
-            # just fail for everything regardless of the agent, wasting a
-            # lot of time across many instances. Mark it distinctly rather
-            # than letting it masquerade as "the agent didn't fix the bug".
-            record.status = "environment_error"
-            record.test_results = {"error": "repo dependency installation failed; see .swebench_venv/pip_install.log"}
+            # 3. Official evaluation: does the patch make FAIL_TO_PASS tests
+            #    pass while keeping PASS_TO_PASS tests passing?
+            if task.get("FAIL_TO_PASS") or task.get("PASS_TO_PASS"):
+                if use_docker:
+                    from swebench.docker_utils import evaluate_fail_to_pass_in_container
+                    f2p = evaluate_fail_to_pass_in_container(
+                        container_name, task, repo_path, timeout=60, python_bin=python_bin,
+                        test_patch_already_applied=test_patch_applied,
+                    )
+                else:
+                    from swebench.utils import evaluate_fail_to_pass
+                    f2p = evaluate_fail_to_pass(
+                        repo_path, task, timeout=60, python_bin=python_bin,
+                        test_patch_already_applied=test_patch_applied,
+                    )
+                record.status = f2p["status"]
+                record.fail_to_pass_count = f2p["fail_to_pass_count"]
+                record.fail_to_pass_total = f2p["fail_to_pass_total"]
+                record.pass_to_pass_count = f2p["pass_to_pass_count"]
+                record.pass_to_pass_total = f2p["pass_to_pass_total"]
+                record.fail_to_pass_results = f2p["fail_to_pass_results"]
+                record.pass_to_pass_results = f2p["pass_to_pass_results"]
+            else:
+                record.status = self._evaluate(record)
+
             record.end_time = time.time()
             record.runtime = record.end_time - record.start_time
+
             return record
-
-        # 2. Run tests on the patched repo, using the repo's own venv
-        proc = __import__("subprocess").run(
-            [python_bin, "-m", "pytest", "--tb=short"],
-            cwd=str(repo_path),
-            capture_output=True, text=True, timeout=60,
-        )
-        record.test_results = {
-            "command": f"{python_bin} -m pytest",
-            "returncode": proc.returncode,
-            "stdout": proc.stdout[:500],
-            "stderr": proc.stderr[:500],
-        }
-
-        # 3. Official evaluation: does the patch make FAIL_TO_PASS tests
-        #    pass while keeping PASS_TO_PASS tests passing?
-        if task.get("FAIL_TO_PASS") or task.get("PASS_TO_PASS"):
-            from swebench.utils import evaluate_fail_to_pass
-            f2p = evaluate_fail_to_pass(
-                repo_path, task, timeout=60, python_bin=python_bin,
-                test_patch_already_applied=test_patch_applied,
-            )
-            record.status = f2p["status"]
-            record.fail_to_pass_count = f2p["fail_to_pass_count"]
-            record.fail_to_pass_total = f2p["fail_to_pass_total"]
-            record.pass_to_pass_count = f2p["pass_to_pass_count"]
-            record.pass_to_pass_total = f2p["pass_to_pass_total"]
-            record.fail_to_pass_results = f2p["fail_to_pass_results"]
-            record.pass_to_pass_results = f2p["pass_to_pass_results"]
-        else:
-            record.status = self._evaluate(record)
-
-        record.end_time = time.time()
-        record.runtime = record.end_time - record.start_time
-
-        return record
+        finally:
+            # Containers are started with `sleep infinity` to stay alive
+            # across the agent's iterations -- without this cleanup they'd
+            # pile up across a grid search (one per instance run). Runs
+            # even if the code above raised or returned early.
+            if container_name:
+                from swebench.docker_utils import stop_instance_container
+                stop_instance_container(container_name)
 
     def _evaluate(self, record: InstanceRecord) -> str:
         """Fallback evaluation for tasks with no FAIL_TO_PASS/PASS_TO_PASS

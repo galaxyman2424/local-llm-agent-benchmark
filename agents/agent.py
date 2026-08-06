@@ -85,6 +85,7 @@ class Agent:
         python_bin: str | None = None,
         fail_to_pass_tests: list[str] | None = None,
         pass_to_pass_tests: list[str] | None = None,
+        container_name: str | None = None,
     ) -> AgentResult:
         """Run the agent on a single SWE-bench-style task.
 
@@ -108,12 +109,22 @@ class Agent:
             synthetic/local task with no gold test lists), the loop falls
             back to the previous behavior of trusting the configured
             ``test_command``'s return code.
+        container_name
+            When running in Docker mode, the container this task's repo is
+            running in (see swebench/docker_utils.py). Propagated to the
+            Actioner (so run_command/run_tests execute inside it) AND to
+            the live _check_target_tests() call below -- without this,
+            the loop's own "am I done" check would run pytest on the host
+            instead of inside the container, testing against an
+            environment that never had the repo's dependencies installed.
         """
         # Point the actioner at this task's repo so file/command tools
         # operate on the right workspace instead of the ambient cwd.
         self.actioner.workspace_dir = repo_path
         if python_bin:
             self.actioner.python_bin = python_bin
+        if container_name:
+            self.actioner.container_name = container_name
 
         fail_to_pass_tests = fail_to_pass_tests or []
         pass_to_pass_tests = pass_to_pass_tests or []
@@ -466,6 +477,7 @@ class Agent:
                         python_bin=self.actioner.python_bin or "python",
                         fail_to_pass_tests=fail_to_pass_tests,
                         pass_to_pass_tests=pass_to_pass_tests,
+                        container_name=self.actioner.container_name,
                     )
                     current_state["target_test_results"] = target_status
                     current_state["target_tests_passing"] = target_status["all_passing"]
@@ -543,34 +555,52 @@ def _check_target_tests(
     python_bin: str,
     fail_to_pass_tests: list[str],
     pass_to_pass_tests: list[str],
+    container_name: str | None = None,
 ) -> dict:
     """Run the instance's actual FAIL_TO_PASS/PASS_TO_PASS node ids live and
     report whether every one currently passes.
 
-    This reuses ``swebench.utils.run_test_ids`` -- the exact same
-    per-node-id runner used by offline evaluation (``evaluate_fail_to_pass``)
-    -- so the loop's own "should I stop" signal matches what the benchmark
-    will actually score, rather than an independent, looser approximation.
+    This reuses ``swebench.utils.run_test_ids`` (or, in Docker mode,
+    ``swebench.docker_utils.run_test_ids_in_container``) -- the exact same
+    per-node-id runner used by offline evaluation -- so the loop's own
+    "should I stop" signal matches what the benchmark will actually score,
+    rather than an independent, looser approximation.
     Imported locally (like the rest of this codebase's cross-package
     imports) to avoid a module-level dependency between the `agents` and
     `swebench` packages.
-    """
-    try:
-        from swebench.utils import run_test_ids
-    except ImportError:
-        # swebench.utils isn't importable in this environment (e.g. a unit
-        # test or non-SWE-bench caller) -- don't crash the loop, just report
-        # "not confirmed" so the fallback returncode-based path never
-        # silently activates by accident.
-        return {
-            "fail_to_pass_results": {},
-            "pass_to_pass_results": {},
-            "all_passing": False,
-            "error": "swebench.utils.run_test_ids unavailable",
-        }
 
-    fail_to_pass_results = run_test_ids(repo_path, fail_to_pass_tests, python_bin=python_bin)
-    pass_to_pass_results = run_test_ids(repo_path, pass_to_pass_tests, python_bin=python_bin)
+    container_name: when set, tests run via `docker exec` against this
+    container instead of a host subprocess -- required in Docker mode,
+    since the host has no venv/interpreter with the repo's dependencies
+    installed at all.
+    """
+    if container_name:
+        try:
+            from swebench.docker_utils import run_test_ids_in_container
+        except ImportError:
+            return {
+                "fail_to_pass_results": {}, "pass_to_pass_results": {},
+                "all_passing": False,
+                "error": "swebench.docker_utils.run_test_ids_in_container unavailable",
+            }
+        fail_to_pass_results = run_test_ids_in_container(container_name, fail_to_pass_tests, python_bin=python_bin)
+        pass_to_pass_results = run_test_ids_in_container(container_name, pass_to_pass_tests, python_bin=python_bin)
+    else:
+        try:
+            from swebench.utils import run_test_ids
+        except ImportError:
+            # swebench.utils isn't importable in this environment (e.g. a unit
+            # test or non-SWE-bench caller) -- don't crash the loop, just report
+            # "not confirmed" so the fallback returncode-based path never
+            # silently activates by accident.
+            return {
+                "fail_to_pass_results": {},
+                "pass_to_pass_results": {},
+                "all_passing": False,
+                "error": "swebench.utils.run_test_ids unavailable",
+            }
+        fail_to_pass_results = run_test_ids(repo_path, fail_to_pass_tests, python_bin=python_bin)
+        pass_to_pass_results = run_test_ids(repo_path, pass_to_pass_tests, python_bin=python_bin)
 
     all_passing = (
         bool(fail_to_pass_tests)
