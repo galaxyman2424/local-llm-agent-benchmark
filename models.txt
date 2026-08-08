@@ -40,4 +40,4 @@ qwen3.5:9b
 
 
 [actioners]
-ornith:9b
+qwen3.5:9b

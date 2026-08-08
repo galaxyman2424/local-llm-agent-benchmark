@@ -71,11 +71,26 @@ class Agent:
     the reasoner as part of previous_actions. Repeats until tests pass,
     the reasoner signals completion, or max_iterations is reached.
     """
-    def __init__(self, reasoner, actioner, max_iterations: int = 50, timeout: float | None = None):
+    def __init__(
+        self,
+        reasoner,
+        actioner,
+        max_iterations: int = 50,
+        timeout: float | None = None,
+        auto_test_check: bool = True,
+    ):
         self.reasoner = reasoner
         self.actioner = actioner
         self.max_iterations = max_iterations
         self.timeout = timeout
+        # If True (default), automatically re-run the instance's FAIL_TO_PASS
+        # tests after every successful edit/delete (cheap: just those tests,
+        # not the full PASS_TO_PASS list), so pass/fail signal reaches the
+        # Reasoner every iteration instead of only when it remembers to call
+        # "run_tests" itself. Set False to fall back to the old behavior
+        # (test signal only on explicit run_tests) if this proves too slow
+        # for a given repo/timeout budget.
+        self.auto_test_check = auto_test_check
 
     def solve(
         self,
@@ -416,6 +431,89 @@ class Agent:
                         entry.pop("deleted_at_iteration", None)
                         entry["stale_since_last_read"] = "last_read_iteration" in entry
 
+            # 6a. Auto-test-check after edits. A stuck/looping Reasoner may
+            # never get around to explicitly choosing "run_tests", which
+            # meant real pass/fail signal only entered previous_actions when
+            # the model happened to ask for it. Instead, after every
+            # successful edit/delete, run a CHEAP check (FAIL_TO_PASS tests
+            # only -- these are usually a handful of tests, unlike
+            # PASS_TO_PASS which can be dozens and would make every single
+            # edit pay a full-suite-sized cost) and fold the result directly
+            # into this action's `result` text, so the very next Reasoner
+            # prompt sees it without an extra iteration. Only escalates to
+            # the full FAIL_TO_PASS+PASS_TO_PASS check (and a possible early
+            # stop) when the cheap check already looks like a full pass --
+            # so the expensive path is rare, not per-edit.
+            auto_check_tool = action.get("tool")
+            if (
+                self.auto_test_check
+                and fail_to_pass_tests
+                and auto_check_tool in WRITE_TOOLS
+                and "error" not in result
+            ):
+                quick_status = _check_target_tests(
+                    repo_path=self.actioner.workspace_dir,
+                    python_bin=self.actioner.python_bin or "python",
+                    fail_to_pass_tests=fail_to_pass_tests,
+                    pass_to_pass_tests=[],  # cheap pass: skip PASS_TO_PASS here
+                )
+                current_state["last_auto_test_check"] = {
+                    "iteration": iteration + 1,
+                    "trigger_tool": auto_check_tool,
+                    "fail_to_pass_results": quick_status["fail_to_pass_results"],
+                }
+
+                fail_to_pass_all_passing = bool(fail_to_pass_tests) and all(
+                    v is True for v in quick_status["fail_to_pass_results"].values()
+                )
+
+                if fail_to_pass_all_passing:
+                    # Promising -- confirm with the full check (this is the
+                    # one that also catches PASS_TO_PASS regressions), since
+                    # a fix that breaks something else doesn't count.
+                    full_status = _check_target_tests(
+                        repo_path=self.actioner.workspace_dir,
+                        python_bin=self.actioner.python_bin or "python",
+                        fail_to_pass_tests=fail_to_pass_tests,
+                        pass_to_pass_tests=pass_to_pass_tests,
+                    )
+                    current_state["target_test_results"] = full_status
+                    current_state["target_tests_passing"] = full_status["all_passing"]
+                    current_state["last_auto_test_check"]["pass_to_pass_results"] = full_status["pass_to_pass_results"]
+
+                    result["result"] = (
+                        str(result.get("result", "")) + "\n\n[Auto-test-check] "
+                        + _summarize_target_status(full_status, fail_to_pass_tests, pass_to_pass_tests)
+                    )
+
+                    if full_status["all_passing"]:
+                        last_test_iteration = iteration
+                        current_state["last_test_result"] = {
+                            "returncode": 0,
+                            "stdout": "(auto-test-check after edit; no ad hoc command run)",
+                            "stderr": "",
+                        }
+                        print(f"[Agent] Auto-test-check after '{auto_check_tool}' (iteration {iteration + 1}): "
+                              "all FAIL_TO_PASS and PASS_TO_PASS tests passing -- stopping.")
+                        test_passed = True
+                        stop_reason = "tests_passed"
+                        exit_reason = "tests_passed"
+                        previous_actions.append({
+                            "iteration": iteration,
+                            "reasoner_plan": reasoner_plan,
+                            "action": action,
+                            "result": result,
+                        })
+                        break
+                else:
+                    # Not there yet -- tell the Reasoner exactly which
+                    # FAIL_TO_PASS tests are still failing, without paying
+                    # for a PASS_TO_PASS run it doesn't need yet.
+                    result["result"] = (
+                        str(result.get("result", "")) + "\n\n[Auto-test-check] "
+                        + _summarize_target_status(quick_status, fail_to_pass_tests, [])
+                    )
+
             current_state["last_plan"] = reasoner_plan
             current_state["last_action"] = action
             current_state["last_result"] = result
@@ -615,6 +713,39 @@ def _check_target_tests(
     }
 
 
+def _summarize_target_status(
+    status: dict,
+    fail_to_pass_tests: list[str],
+    pass_to_pass_tests: list[str],
+) -> str:
+    """Render a `_check_target_tests` result as a short, Reasoner-readable
+    line -- naming which specific tests still fail rather than just a
+    pass/fail count, so the model has something concrete to act on.
+    """
+    f2p_results = status.get("fail_to_pass_results", {})
+    p2p_results = status.get("pass_to_pass_results", {})
+
+    def _failing(results: dict) -> list[str]:
+        return [t for t, v in results.items() if v is not True]
+
+    f2p_pass = sum(1 for v in f2p_results.values() if v is True)
+    parts = [f"FAIL_TO_PASS: {f2p_pass}/{len(fail_to_pass_tests)} passing"]
+    still_failing = _failing(f2p_results)
+    if still_failing:
+        parts.append("still failing: " + ", ".join(still_failing[:5])
+                      + (f" (+{len(still_failing) - 5} more)" if len(still_failing) > 5 else ""))
+
+    if pass_to_pass_tests:
+        p2p_pass = sum(1 for v in p2p_results.values() if v is True)
+        parts.append(f"PASS_TO_PASS: {p2p_pass}/{len(pass_to_pass_tests)} still passing")
+        regressed = _failing(p2p_results)
+        if regressed:
+            parts.append("REGRESSED: " + ", ".join(regressed[:5])
+                          + (f" (+{len(regressed) - 5} more)" if len(regressed) > 5 else ""))
+
+    return "; ".join(parts)
+
+
 def _stable_repr(value) -> str:
     import json as _json
     try:
@@ -670,7 +801,9 @@ def _update_file_cache(
         if "error" not in result:
             content = result.get("result", "")
             if isinstance(content, str):
-                file_cache[path] = _merge_cache_entry(file_cache.get(path), content, parameters)
+                file_cache[path] = _merge_cache_entry(
+                    file_cache.get(path), content, parameters, result
+                )
 
         return
 
@@ -681,16 +814,41 @@ def _update_file_cache(
     }:
         file_cache.pop(path, None)
 
-def _merge_cache_entry(existing_entry: object, content: str, parameters: dict) -> dict:
-    """Merge a newly read chunk into the file cache entry for a path."""
+def _merge_cache_entry(
+    existing_entry: object,
+    content: str,
+    parameters: dict,
+    result: dict | None = None,
+) -> dict:
+    """Merge a newly read chunk into the file cache entry for a path.
+
+    A read is only ever cached as ``{"type": "full"}`` -- and therefore
+    treated by :func:`_is_cached_read` as authoritative for ANY future
+    read_file call on that path -- when the file's entire content was
+    actually returned. A no-range request that the Actioner had to
+    truncate (see actioner.py's ``max_read_lines`` cap) is NOT a full
+    read even though no ``start_line``/``end_line`` was given in the
+    request; caching it as "full" would silently make every line past
+    the cap permanently unreachable, since every later request for those
+    lines -- even an explicit one -- would be short-circuited back to
+    this same truncated snapshot. ``result`` (the Actioner's raw return
+    value, which carries ``truncated``/``displayed_start_line``/
+    ``displayed_end_line``) is the ground truth for this; don't infer
+    completeness from ``parameters`` alone.
+    """
     if not isinstance(content, str):
         return existing_entry if isinstance(existing_entry, dict) else {}
 
+    result = result or {}
+    truncated = bool(result.get("truncated"))
+
     start_line = parameters.get("start_line")
     end_line = parameters.get("end_line")
+    no_range_requested = start_line in (None, "") and end_line in (None, "")
 
-    # A full-file read replaces any prior partial context for that path.
-    if start_line in (None, "") and end_line in (None, ""):
+    # A full-file read replaces any prior partial context for that path --
+    # but only when nothing was actually cut off.
+    if no_range_requested and not truncated:
         return {"type": "full", "content": content}
 
     if isinstance(existing_entry, str):
@@ -702,9 +860,18 @@ def _merge_cache_entry(existing_entry: object, content: str, parameters: dict) -
     if existing_entry.get("type") == "full":
         return existing_entry
 
+    # Key the chunk by the range actually displayed (falling back to the
+    # requested range when the Actioner didn't report one, e.g. an older
+    # caller) rather than the raw request -- a truncated no-range request
+    # has no requested start/end at all, so it must be keyed by what was
+    # really shown or it could never be told apart from a different range
+    # later.
+    chunk_start = result.get("displayed_start_line", start_line if not no_range_requested else 1)
+    chunk_end = result.get("displayed_end_line", end_line)
+
     chunk = {
-        "start_line": start_line,
-        "end_line": end_line,
+        "start_line": chunk_start,
+        "end_line": chunk_end,
         "content": content,
     }
     chunks = existing_entry.get("chunks", [])
@@ -746,10 +913,16 @@ def _is_cached_read(
     if entry.get("type") == "full":
         return True
 
+    # NOTE: deliberately no "no range requested -> treat as cached" branch
+    # here for chunked entries. A chunked entry, by construction, never
+    # represents the whole file (see _merge_cache_entry) -- so a no-range
+    # request ("give me the file") is NOT satisfied by having some earlier
+    # partial chunk lying around, even if that chunk happens to start at
+    # line 1. Treating it as cached previously caused every later no-range
+    # read for a long file to keep replaying the same truncated first
+    # chunk, making the tail of the file permanently unreachable.
     start_line = parameters.get("start_line")
     end_line = parameters.get("end_line")
-    if start_line in (None, "") and end_line in (None, ""):
-        return True
 
     for chunk in entry.get("chunks", []):
         if chunk.get("start_line") == start_line and chunk.get("end_line") == end_line:

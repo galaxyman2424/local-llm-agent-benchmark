@@ -185,6 +185,16 @@ class Actioner:
                     "tool": tool_name,
                     "result": numbered + notice,
                     "total_lines": total_lines,
+                    # Ground truth for the caller's file cache: exactly which
+                    # lines were actually shown, and whether this cut off
+                    # before the end of the file. Without this, a no-range
+                    # request that got capped by max_read_lines looks
+                    # indistinguishable from a genuine full-file read, and a
+                    # cache built from `result` text alone can't tell the
+                    # difference -- see agents/agent.py's _merge_cache_entry.
+                    "displayed_start_line": start_line,
+                    "displayed_end_line": end_line,
+                    "truncated": end_line < total_lines,
                 }
 
             elif tool_name == "replace_lines":
@@ -268,8 +278,42 @@ class Actioner:
                     return {"tool": tool_name, "error": "`search` cannot be empty."}
 
                 occurrences = content.count(search_text)
+                match_note = ""
+
                 if occurrences == 0:
-                    return {"tool": tool_name, "error": f"SEARCH text not found in {path}."}
+                    # The exact search text isn't there. Before giving up,
+                    # try two cheap, deterministic recovery strategies rather
+                    # than immediately erroring and letting the model retry
+                    # the identical (already-failing) search verbatim:
+                    #
+                    # 1. De-escaped backslashes: small models frequently
+                    #    over-escape when generating a `search` string that
+                    #    contains regex/backslash sequences (e.g. emitting
+                    #    "\\s" for a literal "\s" in the source file). Retry
+                    #    with doubled backslashes collapsed.
+                    # 2. Fuzzy whitespace match: `_fuzzy_replace` ignores
+                    #    per-line leading/trailing whitespace, which covers
+                    #    the far more common case of indentation drift
+                    #    between what the model remembers and the real file.
+                    deescaped_search = search_text.replace("\\\\", "\\")
+                    if deescaped_search != search_text and content.count(deescaped_search) == 1:
+                        search_text = deescaped_search
+                        occurrences = 1
+                        match_note = " (matched after collapsing doubled backslashes in `search`)"
+                    else:
+                        fuzzy_result = self._fuzzy_replace(content, search_text, replace_text)
+                        if fuzzy_result is not None:
+                            with open(path, 'w') as f:
+                                f.write(fuzzy_result)
+                            return {
+                                "tool": tool_name,
+                                "result": (
+                                    f"Replaced text in {path} (matched ignoring "
+                                    "per-line leading/trailing whitespace)."
+                                ),
+                            }
+                        return {"tool": tool_name, "error": f"SEARCH text not found in {path}."}
+
                 if occurrences > 1:
                     return {
                         "tool": tool_name,
@@ -283,7 +327,7 @@ class Actioner:
                 new_content = content.replace(search_text, replace_text, 1)
                 with open(path, 'w') as f:
                     f.write(new_content)
-                return {"tool": tool_name, "result": f"Replaced text in {path} (1 occurrence)."}
+                return {"tool": tool_name, "result": f"Replaced text in {path} (1 occurrence){match_note}."}
 
             elif tool_name == "delete_file":
                 path = self._resolve_path(params.get("path", ""))
@@ -429,6 +473,32 @@ class Actioner:
         num_predict = 4096 if next_action == "write_to_file" else 512
 
         reasoner_params = reasoner_plan.get("parameters", {}) or {}
+
+        # Common Reasoner confusion: it says next_action="replace_in_file" (or
+        # "edit_file") but actually supplies replace_lines-shaped parameters
+        # (start_line/end_line/content instead of search/replace) -- likely
+        # because it knows the exact line range but reaches for the wrong
+        # tool name. Left as-is, this fails schema validation, falls through
+        # to the slow LLM-translation path, and small Actioner models
+        # frequently can't recover the original intent there at all (seen in
+        # practice: it just re-reads the file instead). Since the *shape* of
+        # the parameters unambiguously indicates which tool was meant, fix
+        # the tool name here -- deterministically, before any LLM call --
+        # rather than hoping the translation step guesses it.
+        if next_action in ("replace_in_file", "edit_file") and isinstance(reasoner_params, dict):
+            has_replace_lines_shape = (
+                "search" not in reasoner_params
+                and "start_line" in reasoner_params
+                and "end_line" in reasoner_params
+            )
+            if has_replace_lines_shape:
+                if "content_str" in reasoner_params and "content" not in reasoner_params:
+                    reasoner_params = dict(reasoner_params)
+                    reasoner_params["content"] = reasoner_params.pop("content_str")
+                print(f"[Actioner] Reasoner asked for '{next_action}' but supplied "
+                      "replace_lines-shaped parameters (start_line/end_line/content) "
+                      "-- correcting tool to 'replace_lines'.")
+                next_action = "replace_lines"
 
         # Fast path: the Reasoner already gave us a valid, schema-shaped action.
         # Don't waste a token-capped LLM call re-typing a full file body back out.
