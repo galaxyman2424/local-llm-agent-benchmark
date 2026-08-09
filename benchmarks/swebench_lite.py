@@ -260,7 +260,8 @@ class SWEBenchLite:
                 return record
 
         agent_result = agent.solve(
-            str(repo_path), task_text, test_command=test_cmd,
+            str(workspace_dir), task_description or instance.get("problem_statement", ""),
+            test_command=test_cmd, python_bin=python_bin,          # <-- add this
             fail_to_pass_tests=fail_to_pass, pass_to_pass_tests=pass_to_pass,
         )
 

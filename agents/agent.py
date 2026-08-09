@@ -14,6 +14,27 @@ STOP_ACTIONS = ("done", "submit_solution")
 # produced before the loop gives up rather than burning iterations.
 MAX_REPEATED_ACTIONS = 4
 
+# How many consecutive iterations may pass with NO new information --
+# either a search_code call returning an empty result (regardless of the
+# exact query text, which legitimately varies between calls and so never
+# trips MAX_REPEATED_ACTIONS' exact-tuple comparison), or a read_file/
+# list_directory call that only ever hit the cache -- before the loop
+# gives up. Deliberately independent of exact action-tuple repetition: it
+# catches a Reasoner that keeps "trying something slightly different"
+# while still not learning anything new (see trace 6938: 8 near-duplicate
+# empty search_code calls that each individually reset the exact-repeat
+# counter).
+MAX_NO_PROGRESS_STREAK = 4
+
+# How many consecutive iterations may choose a read-only tool
+# (read_file/search_code/list_directory) with zero write_to_file/
+# replace_in_file/replace_lines attempts before the Reasoner is nudged to
+# actually attempt an edit instead of continuing to gather context.
+READ_ONLY_NUDGE_THRESHOLD = 10
+
+READ_ONLY_TOOLS = {"read_file", "search_code", "list_directory"}
+WRITE_ACTION_TOOLS = {"write_to_file", "replace_in_file", "replace_lines", "edit_file"}
+
 # Every distinct way the loop can end -- makes "incomplete"/"timeout"
 # statuses actually explain themselves instead of just being a dead end.
 STOP_REASONS = (
@@ -22,6 +43,10 @@ STOP_REASONS = (
     "reasoner_failed",     # Reasoner returned no usable plan (after its own retry)
     "actioner_failed",     # Actioner couldn't produce a valid tool call
     "repeated_action",     # Same (tool, parameters) fired too many times
+    "no_progress",         # Several iterations in a row produced no new
+                            # information (empty search_code results, or
+                            # cache-hit reads/listings) -- see
+                            # MAX_NO_PROGRESS_STREAK.
     "max_iterations",      # Ran out of budget
 )
 
@@ -71,26 +96,11 @@ class Agent:
     the reasoner as part of previous_actions. Repeats until tests pass,
     the reasoner signals completion, or max_iterations is reached.
     """
-    def __init__(
-        self,
-        reasoner,
-        actioner,
-        max_iterations: int = 50,
-        timeout: float | None = None,
-        auto_test_check: bool = True,
-    ):
+    def __init__(self, reasoner, actioner, max_iterations: int = 50, timeout: float | None = None):
         self.reasoner = reasoner
         self.actioner = actioner
         self.max_iterations = max_iterations
         self.timeout = timeout
-        # If True (default), automatically re-run the instance's FAIL_TO_PASS
-        # tests after every successful edit/delete (cheap: just those tests,
-        # not the full PASS_TO_PASS list), so pass/fail signal reaches the
-        # Reasoner every iteration instead of only when it remembers to call
-        # "run_tests" itself. Set False to fall back to the old behavior
-        # (test signal only on explicit run_tests) if this proves too slow
-        # for a given repo/timeout budget.
-        self.auto_test_check = auto_test_check
 
     def solve(
         self,
@@ -106,6 +116,22 @@ class Agent:
 
         Parameters
         ----------
+        container_name
+            When set (Docker mode -- see ``benchmarks/swebench.py``'s
+            ``use_docker`` path), forwarded straight to the Actioner so its
+            ``run_command``/``run_tests`` branches execute inside that
+            container via ``docker_utils.exec_in_container`` instead of
+            ``subprocess.run()`` on the host. File-editing tools are
+            unaffected either way, since ``workspace_dir`` is the same
+            bind-mounted directory the container sees.
+
+            Always assigned (not just when truthy), same reasoning as
+            ``workspace_dir`` above: this ``Agent``/``Actioner`` pair is
+            reused across every instance in a single ``run_experiment``
+            call (see ``experiments/run_experiment.py``), so a Docker
+            instance followed by a non-Docker one must actually clear the
+            previous container name rather than silently keep routing
+            commands into an already-stopped container.
         fail_to_pass_tests, pass_to_pass_tests
             The instance's gold FAIL_TO_PASS / PASS_TO_PASS test node ids,
             when known (e.g. from the SWE-bench Lite dataset). These are
@@ -124,22 +150,13 @@ class Agent:
             synthetic/local task with no gold test lists), the loop falls
             back to the previous behavior of trusting the configured
             ``test_command``'s return code.
-        container_name
-            When running in Docker mode, the container this task's repo is
-            running in (see swebench/docker_utils.py). Propagated to the
-            Actioner (so run_command/run_tests execute inside it) AND to
-            the live _check_target_tests() call below -- without this,
-            the loop's own "am I done" check would run pytest on the host
-            instead of inside the container, testing against an
-            environment that never had the repo's dependencies installed.
         """
         # Point the actioner at this task's repo so file/command tools
         # operate on the right workspace instead of the ambient cwd.
         self.actioner.workspace_dir = repo_path
         if python_bin:
             self.actioner.python_bin = python_bin
-        if container_name:
-            self.actioner.container_name = container_name
+        self.actioner.container_name = container_name
 
         fail_to_pass_tests = fail_to_pass_tests or []
         pass_to_pass_tests = pass_to_pass_tests or []
@@ -173,6 +190,12 @@ class Agent:
         #oscillation detection window + test-staleness tracking
         action_window: deque = deque(maxlen=8)
         last_test_iteration = -999
+
+        # No-new-information / read-without-editing streak tracking (see
+        # MAX_NO_PROGRESS_STREAK / READ_ONLY_NUDGE_THRESHOLD above).
+        read_only_streak = 0
+        no_progress_streak = 0
+        last_empty_search_query: str | None = None
 
         import time
         solve_start = time.time()
@@ -210,13 +233,43 @@ class Agent:
                     "in a row without making progress. Try a genuinely different approach."
                 )
 
+            # Nudge toward attempting an edit once the Reasoner has spent
+            # many iterations purely reading/searching (observation: "no
+            # nudge toward attempting an edit exists").
+            edit_nudge = None
+            if read_only_streak >= READ_ONLY_NUDGE_THRESHOLD:
+                edit_nudge = (
+                    f"NOTE: you have made {read_only_streak} consecutive read_file/"
+                    "search_code/list_directory calls without attempting a single "
+                    "write_to_file, replace_in_file, or replace_lines. If you "
+                    "already have enough information to make the fix, your "
+                    "next_action should be an edit now -- not another read or "
+                    "search."
+                )
+
+            # Empty search results are a strong "there's nothing here" signal
+            # that the Reasoner previously had no explicit feedback about
+            # (observation: "empty search results get no special handling").
+            empty_search_hint = None
+            if last_empty_search_query is not None:
+                empty_search_hint = (
+                    f"NOTE: your last search_code query {last_empty_search_query!r} "
+                    "returned no results. Do not repeat that exact query -- either "
+                    "try different search terms (e.g. a related identifier, "
+                    "partial name, or distinctive text from an error message), or "
+                    "read a file directly if you already know where to look."
+                )
+
+            hint_parts = [h for h in (stagnation_hint, edit_nudge, empty_search_hint) if h]
+            combined_hint = "\n".join(hint_parts) if hint_parts else None
+
             # 1. Reasoner decides what to do
             reasoner_plan = self.reasoner.plan(
                 task=task,
                 current_state=current_state,
                 previous_actions=previous_actions,
                 avoid_action=last_action_tuple if repeated_action_count >= 1 else None,
-                stagnation_hint=stagnation_hint,
+                stagnation_hint=combined_hint,
             )
 
             if not reasoner_plan:
@@ -252,19 +305,29 @@ class Agent:
 
             is_valid, error = validate_action(action)
 
+            chosen_tool = action.get("tool") if isinstance(action, dict) else None
+
+            # Track how many consecutive iterations have chosen a read-only
+            # tool with zero write attempts, for the edit_nudge computed at
+            # the top of the NEXT iteration.
+            if chosen_tool in READ_ONLY_TOOLS:
+                read_only_streak += 1
+            elif chosen_tool in WRITE_ACTION_TOOLS:
+                read_only_streak = 0
+
             # 4. Loop detection: same tool+parameters repeated too often.
             #
-            # IMPORTANT: this must run BEFORE the cached-read/cached-listing
-            # short-circuits below. Those short-circuits `continue` the loop
-            # for read_file/list_directory calls that hit the cache -- if
-            # loop detection ran after them, a model stuck alternating
-            # between two already-cached reads would never update
-            # action_key/repeated_action_count/action_window at all, since
-            # every one of those calls would exit via `continue` first. That
-            # made cache-hit loops (e.g. re-reading the same file range over
-            # and over) completely invisible to this detector, letting them
-            # burn the full iteration budget instead of being caught.
-            action_key = (action.get("tool"), _stable_repr(action.get("parameters", {})))
+            # IMPORTANT: this now runs BEFORE the cached-read/cached-listing
+            # short-circuits below. Previously it ran after them, and those
+            # short-circuits `continue`d the loop immediately -- so a model
+            # stuck re-requesting an already-cached file range or directory
+            # listing was fed the cached content back every time WITHOUT
+            # ever updating `last_action_key`/`action_window`, meaning
+            # neither the exact-repeat counter nor the oscillation-window
+            # check could ever see it (see traces 12907 and 14995: a model
+            # alternating search_code/read_file or repeating the same
+            # read_file range indefinitely, purely against the cache).
+            action_key = (chosen_tool, _stable_repr(action.get("parameters", {})))
             if action_key == last_action_key:
                 repeated_action_count += 1
             else:
@@ -278,21 +341,11 @@ class Agent:
                 exit_reason = "repeated_action"
                 break
 
-            # Detect A-B-A-B style oscillation, not just immediate repeats.
-            #
-            # NOTE: period=1 is deliberately excluded here. window[-1:] ==
-            # window[-2:-1] for period=1 is exactly the same condition as
-            # action_key == last_action_key above -- but it used to run in
-            # this same loop over periods (1, 2, 3), which meant it fired on
-            # the very first repeat (repeated_action_count == 1) instead of
-            # waiting for MAX_REPEATED_ACTIONS in a row. That made the
-            # MAX_REPEATED_ACTIONS=4 threshold unreachable in practice: any
-            # single exact repeat killed the run immediately via this
-            # oscillation check before the counter above could ever reach 4.
+            # NEW: detect A-B-A-B style oscillation, not just immediate repeats
             action_window.append(action_key)
             window = list(action_window)
             cycle_detected = False
-            for period in (2, 3):
+            for period in (1, 2, 3):
                 if len(window) >= period * 2 and window[-period:] == window[-2 * period:-period]:
                     cycle_detected = True
                     break
@@ -310,6 +363,14 @@ class Agent:
                         path
                     )
                 )
+
+                # Re-requesting content already sitting in the cache is a
+                # strong "not learning from prior output" signal even when
+                # the exact parameters differ from the immediately
+                # preceding call (e.g. a slightly different but
+                # still-cached line range) -- tracked separately from the
+                # exact-tuple repeated_action_count above.
+                no_progress_streak += 1
 
                 # Instead of returning an error, present the cached contents
                 # as the result so the Reasoner sees the file content in the
@@ -338,6 +399,13 @@ class Agent:
                     },
                 })
 
+                if no_progress_streak >= MAX_NO_PROGRESS_STREAK:
+                    print("[Agent] No new information for several iterations in a "
+                          "row (re-reading cached content); stopping.")
+                    stop_reason = "no_progress"
+                    exit_reason = "no_progress"
+                    break
+
                 continue
 
             if _is_cached_listing(current_state, action):
@@ -348,6 +416,8 @@ class Agent:
                         listing_path
                     )
                 )
+
+                no_progress_streak += 1
 
                 # Same pattern as the cached-read short-circuit above: feed
                 # back the cached listing as the result rather than an
@@ -368,6 +438,13 @@ class Agent:
                     },
                 })
 
+                if no_progress_streak >= MAX_NO_PROGRESS_STREAK:
+                    print("[Agent] No new information for several iterations in a "
+                          "row (re-listing cached directory); stopping.")
+                    stop_reason = "no_progress"
+                    exit_reason = "no_progress"
+                    break
+
                 continue
 
             # 5. Execute the concrete tool call (deterministic)
@@ -382,6 +459,33 @@ class Agent:
             total_tool_calls += 1
             last_reasoner_plan = reasoner_plan
             last_action, last_result = action, result
+
+            # Track search_code calls that return nothing -- an empty
+            # result is a strong "there's nothing here" signal, but query
+            # text legitimately varies between calls (a reworded but still
+            # empty search), so this can't rely on exact-tuple repetition
+            # (see trace 6938: 8 near-duplicate empty search_code calls
+            # before the exact-repeat counter ever caught one). Any other
+            # successful, non-cached action (cached read_file/list_directory
+            # calls never reach this point -- they were already handled and
+            # `continue`d above) counts as new information and resets it.
+            if chosen_tool == "search_code" and "error" not in result:
+                if not result.get("result"):
+                    no_progress_streak += 1
+                    last_empty_search_query = (action.get("parameters") or {}).get("query")
+                else:
+                    no_progress_streak = 0
+                    last_empty_search_query = None
+            elif "error" not in result:
+                no_progress_streak = 0
+                last_empty_search_query = None
+
+            if no_progress_streak >= MAX_NO_PROGRESS_STREAK:
+                print("[Agent] No new information for several iterations in a row "
+                      "(repeated empty searches); stopping.")
+                stop_reason = "no_progress"
+                exit_reason = "no_progress"
+                break
 
             # 5a. Update the persistent file cache.
             _update_file_cache(current_state, action, result)
@@ -430,89 +534,6 @@ class Agent:
                         entry["last_modified_tool"] = tool
                         entry.pop("deleted_at_iteration", None)
                         entry["stale_since_last_read"] = "last_read_iteration" in entry
-
-            # 6a. Auto-test-check after edits. A stuck/looping Reasoner may
-            # never get around to explicitly choosing "run_tests", which
-            # meant real pass/fail signal only entered previous_actions when
-            # the model happened to ask for it. Instead, after every
-            # successful edit/delete, run a CHEAP check (FAIL_TO_PASS tests
-            # only -- these are usually a handful of tests, unlike
-            # PASS_TO_PASS which can be dozens and would make every single
-            # edit pay a full-suite-sized cost) and fold the result directly
-            # into this action's `result` text, so the very next Reasoner
-            # prompt sees it without an extra iteration. Only escalates to
-            # the full FAIL_TO_PASS+PASS_TO_PASS check (and a possible early
-            # stop) when the cheap check already looks like a full pass --
-            # so the expensive path is rare, not per-edit.
-            auto_check_tool = action.get("tool")
-            if (
-                self.auto_test_check
-                and fail_to_pass_tests
-                and auto_check_tool in WRITE_TOOLS
-                and "error" not in result
-            ):
-                quick_status = _check_target_tests(
-                    repo_path=self.actioner.workspace_dir,
-                    python_bin=self.actioner.python_bin or "python",
-                    fail_to_pass_tests=fail_to_pass_tests,
-                    pass_to_pass_tests=[],  # cheap pass: skip PASS_TO_PASS here
-                )
-                current_state["last_auto_test_check"] = {
-                    "iteration": iteration + 1,
-                    "trigger_tool": auto_check_tool,
-                    "fail_to_pass_results": quick_status["fail_to_pass_results"],
-                }
-
-                fail_to_pass_all_passing = bool(fail_to_pass_tests) and all(
-                    v is True for v in quick_status["fail_to_pass_results"].values()
-                )
-
-                if fail_to_pass_all_passing:
-                    # Promising -- confirm with the full check (this is the
-                    # one that also catches PASS_TO_PASS regressions), since
-                    # a fix that breaks something else doesn't count.
-                    full_status = _check_target_tests(
-                        repo_path=self.actioner.workspace_dir,
-                        python_bin=self.actioner.python_bin or "python",
-                        fail_to_pass_tests=fail_to_pass_tests,
-                        pass_to_pass_tests=pass_to_pass_tests,
-                    )
-                    current_state["target_test_results"] = full_status
-                    current_state["target_tests_passing"] = full_status["all_passing"]
-                    current_state["last_auto_test_check"]["pass_to_pass_results"] = full_status["pass_to_pass_results"]
-
-                    result["result"] = (
-                        str(result.get("result", "")) + "\n\n[Auto-test-check] "
-                        + _summarize_target_status(full_status, fail_to_pass_tests, pass_to_pass_tests)
-                    )
-
-                    if full_status["all_passing"]:
-                        last_test_iteration = iteration
-                        current_state["last_test_result"] = {
-                            "returncode": 0,
-                            "stdout": "(auto-test-check after edit; no ad hoc command run)",
-                            "stderr": "",
-                        }
-                        print(f"[Agent] Auto-test-check after '{auto_check_tool}' (iteration {iteration + 1}): "
-                              "all FAIL_TO_PASS and PASS_TO_PASS tests passing -- stopping.")
-                        test_passed = True
-                        stop_reason = "tests_passed"
-                        exit_reason = "tests_passed"
-                        previous_actions.append({
-                            "iteration": iteration,
-                            "reasoner_plan": reasoner_plan,
-                            "action": action,
-                            "result": result,
-                        })
-                        break
-                else:
-                    # Not there yet -- tell the Reasoner exactly which
-                    # FAIL_TO_PASS tests are still failing, without paying
-                    # for a PASS_TO_PASS run it doesn't need yet.
-                    result["result"] = (
-                        str(result.get("result", "")) + "\n\n[Auto-test-check] "
-                        + _summarize_target_status(quick_status, fail_to_pass_tests, [])
-                    )
 
             current_state["last_plan"] = reasoner_plan
             current_state["last_action"] = action
@@ -575,7 +596,6 @@ class Agent:
                         python_bin=self.actioner.python_bin or "python",
                         fail_to_pass_tests=fail_to_pass_tests,
                         pass_to_pass_tests=pass_to_pass_tests,
-                        container_name=self.actioner.container_name,
                     )
                     current_state["target_test_results"] = target_status
                     current_state["target_tests_passing"] = target_status["all_passing"]
@@ -653,52 +673,34 @@ def _check_target_tests(
     python_bin: str,
     fail_to_pass_tests: list[str],
     pass_to_pass_tests: list[str],
-    container_name: str | None = None,
 ) -> dict:
     """Run the instance's actual FAIL_TO_PASS/PASS_TO_PASS node ids live and
     report whether every one currently passes.
 
-    This reuses ``swebench.utils.run_test_ids`` (or, in Docker mode,
-    ``swebench.docker_utils.run_test_ids_in_container``) -- the exact same
-    per-node-id runner used by offline evaluation -- so the loop's own
-    "should I stop" signal matches what the benchmark will actually score,
-    rather than an independent, looser approximation.
+    This reuses ``swebench.utils.run_test_ids`` -- the exact same
+    per-node-id runner used by offline evaluation (``evaluate_fail_to_pass``)
+    -- so the loop's own "should I stop" signal matches what the benchmark
+    will actually score, rather than an independent, looser approximation.
     Imported locally (like the rest of this codebase's cross-package
     imports) to avoid a module-level dependency between the `agents` and
     `swebench` packages.
-
-    container_name: when set, tests run via `docker exec` against this
-    container instead of a host subprocess -- required in Docker mode,
-    since the host has no venv/interpreter with the repo's dependencies
-    installed at all.
     """
-    if container_name:
-        try:
-            from swebench.docker_utils import run_test_ids_in_container
-        except ImportError:
-            return {
-                "fail_to_pass_results": {}, "pass_to_pass_results": {},
-                "all_passing": False,
-                "error": "swebench.docker_utils.run_test_ids_in_container unavailable",
-            }
-        fail_to_pass_results = run_test_ids_in_container(container_name, fail_to_pass_tests, python_bin=python_bin)
-        pass_to_pass_results = run_test_ids_in_container(container_name, pass_to_pass_tests, python_bin=python_bin)
-    else:
-        try:
-            from swebench.utils import run_test_ids
-        except ImportError:
-            # swebench.utils isn't importable in this environment (e.g. a unit
-            # test or non-SWE-bench caller) -- don't crash the loop, just report
-            # "not confirmed" so the fallback returncode-based path never
-            # silently activates by accident.
-            return {
-                "fail_to_pass_results": {},
-                "pass_to_pass_results": {},
-                "all_passing": False,
-                "error": "swebench.utils.run_test_ids unavailable",
-            }
-        fail_to_pass_results = run_test_ids(repo_path, fail_to_pass_tests, python_bin=python_bin)
-        pass_to_pass_results = run_test_ids(repo_path, pass_to_pass_tests, python_bin=python_bin)
+    try:
+        from swebench.utils import run_test_ids
+    except ImportError:
+        # swebench.utils isn't importable in this environment (e.g. a unit
+        # test or non-SWE-bench caller) -- don't crash the loop, just report
+        # "not confirmed" so the fallback returncode-based path never
+        # silently activates by accident.
+        return {
+            "fail_to_pass_results": {},
+            "pass_to_pass_results": {},
+            "all_passing": False,
+            "error": "swebench.utils.run_test_ids unavailable",
+        }
+
+    fail_to_pass_results = run_test_ids(repo_path, fail_to_pass_tests, python_bin=python_bin)
+    pass_to_pass_results = run_test_ids(repo_path, pass_to_pass_tests, python_bin=python_bin)
 
     all_passing = (
         bool(fail_to_pass_tests)
@@ -711,39 +713,6 @@ def _check_target_tests(
         "pass_to_pass_results": pass_to_pass_results,
         "all_passing": all_passing,
     }
-
-
-def _summarize_target_status(
-    status: dict,
-    fail_to_pass_tests: list[str],
-    pass_to_pass_tests: list[str],
-) -> str:
-    """Render a `_check_target_tests` result as a short, Reasoner-readable
-    line -- naming which specific tests still fail rather than just a
-    pass/fail count, so the model has something concrete to act on.
-    """
-    f2p_results = status.get("fail_to_pass_results", {})
-    p2p_results = status.get("pass_to_pass_results", {})
-
-    def _failing(results: dict) -> list[str]:
-        return [t for t, v in results.items() if v is not True]
-
-    f2p_pass = sum(1 for v in f2p_results.values() if v is True)
-    parts = [f"FAIL_TO_PASS: {f2p_pass}/{len(fail_to_pass_tests)} passing"]
-    still_failing = _failing(f2p_results)
-    if still_failing:
-        parts.append("still failing: " + ", ".join(still_failing[:5])
-                      + (f" (+{len(still_failing) - 5} more)" if len(still_failing) > 5 else ""))
-
-    if pass_to_pass_tests:
-        p2p_pass = sum(1 for v in p2p_results.values() if v is True)
-        parts.append(f"PASS_TO_PASS: {p2p_pass}/{len(pass_to_pass_tests)} still passing")
-        regressed = _failing(p2p_results)
-        if regressed:
-            parts.append("REGRESSED: " + ", ".join(regressed[:5])
-                          + (f" (+{len(regressed) - 5} more)" if len(regressed) > 5 else ""))
-
-    return "; ".join(parts)
 
 
 def _stable_repr(value) -> str:
@@ -801,9 +770,7 @@ def _update_file_cache(
         if "error" not in result:
             content = result.get("result", "")
             if isinstance(content, str):
-                file_cache[path] = _merge_cache_entry(
-                    file_cache.get(path), content, parameters, result
-                )
+                file_cache[path] = _merge_cache_entry(file_cache.get(path), content, parameters)
 
         return
 
@@ -814,41 +781,16 @@ def _update_file_cache(
     }:
         file_cache.pop(path, None)
 
-def _merge_cache_entry(
-    existing_entry: object,
-    content: str,
-    parameters: dict,
-    result: dict | None = None,
-) -> dict:
-    """Merge a newly read chunk into the file cache entry for a path.
-
-    A read is only ever cached as ``{"type": "full"}`` -- and therefore
-    treated by :func:`_is_cached_read` as authoritative for ANY future
-    read_file call on that path -- when the file's entire content was
-    actually returned. A no-range request that the Actioner had to
-    truncate (see actioner.py's ``max_read_lines`` cap) is NOT a full
-    read even though no ``start_line``/``end_line`` was given in the
-    request; caching it as "full" would silently make every line past
-    the cap permanently unreachable, since every later request for those
-    lines -- even an explicit one -- would be short-circuited back to
-    this same truncated snapshot. ``result`` (the Actioner's raw return
-    value, which carries ``truncated``/``displayed_start_line``/
-    ``displayed_end_line``) is the ground truth for this; don't infer
-    completeness from ``parameters`` alone.
-    """
+def _merge_cache_entry(existing_entry: object, content: str, parameters: dict) -> dict:
+    """Merge a newly read chunk into the file cache entry for a path."""
     if not isinstance(content, str):
         return existing_entry if isinstance(existing_entry, dict) else {}
 
-    result = result or {}
-    truncated = bool(result.get("truncated"))
-
     start_line = parameters.get("start_line")
     end_line = parameters.get("end_line")
-    no_range_requested = start_line in (None, "") and end_line in (None, "")
 
-    # A full-file read replaces any prior partial context for that path --
-    # but only when nothing was actually cut off.
-    if no_range_requested and not truncated:
+    # A full-file read replaces any prior partial context for that path.
+    if start_line in (None, "") and end_line in (None, ""):
         return {"type": "full", "content": content}
 
     if isinstance(existing_entry, str):
@@ -860,18 +802,9 @@ def _merge_cache_entry(
     if existing_entry.get("type") == "full":
         return existing_entry
 
-    # Key the chunk by the range actually displayed (falling back to the
-    # requested range when the Actioner didn't report one, e.g. an older
-    # caller) rather than the raw request -- a truncated no-range request
-    # has no requested start/end at all, so it must be keyed by what was
-    # really shown or it could never be told apart from a different range
-    # later.
-    chunk_start = result.get("displayed_start_line", start_line if not no_range_requested else 1)
-    chunk_end = result.get("displayed_end_line", end_line)
-
     chunk = {
-        "start_line": chunk_start,
-        "end_line": chunk_end,
+        "start_line": start_line,
+        "end_line": end_line,
         "content": content,
     }
     chunks = existing_entry.get("chunks", [])
@@ -913,16 +846,10 @@ def _is_cached_read(
     if entry.get("type") == "full":
         return True
 
-    # NOTE: deliberately no "no range requested -> treat as cached" branch
-    # here for chunked entries. A chunked entry, by construction, never
-    # represents the whole file (see _merge_cache_entry) -- so a no-range
-    # request ("give me the file") is NOT satisfied by having some earlier
-    # partial chunk lying around, even if that chunk happens to start at
-    # line 1. Treating it as cached previously caused every later no-range
-    # read for a long file to keep replaying the same truncated first
-    # chunk, making the tail of the file permanently unreachable.
     start_line = parameters.get("start_line")
     end_line = parameters.get("end_line")
+    if start_line in (None, "") and end_line in (None, ""):
+        return True
 
     for chunk in entry.get("chunks", []):
         if chunk.get("start_line") == start_line and chunk.get("end_line") == end_line:

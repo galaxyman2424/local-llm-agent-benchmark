@@ -36,8 +36,8 @@
 # with # are comments and blank lines are ignored.
 
 [reasoners]
-qwen3.5:9b
+gemma4:26b-a4b-it-q4_K_M
 
 
 [actioners]
-qwen3.5:9b
+gemma4:26b-a4b-it-q4_K_M

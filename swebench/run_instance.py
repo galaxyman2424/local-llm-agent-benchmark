@@ -196,7 +196,8 @@ def run_instance(
         # 6. Let the agent modify the repository in the isolated workspace
         agent_result = agent.solve(
             str(workspace_dir), task_description or instance.get("problem_statement", ""),
-            test_command=test_cmd, fail_to_pass_tests=fail_to_pass, pass_to_pass_tests=pass_to_pass,
+            test_command=test_cmd, python_bin=python_bin,          # <-- add this
+            fail_to_pass_tests=fail_to_pass, pass_to_pass_tests=pass_to_pass,
         )
 
         result.num_iterations = agent_result.num_iterations

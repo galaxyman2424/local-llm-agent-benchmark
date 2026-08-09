@@ -35,7 +35,6 @@ class Actioner:
     including file operations, code search, command execution, and test running.
     """
 
-class Actioner:
     def __init__(self, model_id="ornith:9b", workspace_dir=None, timeout_seconds=120.0,
              num_ctx=DEFAULT_NUM_CTX, max_read_lines=300, python_bin: str | None = None,
              container_name: str | None = None):
@@ -125,6 +124,17 @@ class Actioner:
                 "All file operations must stay inside the workspace."
             )
         return resolved
+
+    def _use_venv_python(self, command: str) -> str:
+        """Rewrite bare `pytest`/`python(3)` invocations to use this workspace's
+        isolated venv interpreter, so mid-run test signal matches the venv the
+        benchmark actually evaluates against."""
+        import re
+        if self.python_bin in (None, "python"):
+            return command
+        command = re.sub(r'(?<![\w./])pytest\b', f'"{self.python_bin}" -m pytest', command)
+        command = re.sub(r'(?<![\w./])python3?\b', f'"{self.python_bin}"', command)
+        return command
 
     def execute(self, action: dict[str, Any]) -> dict[str, Any]:
         """Deterministically execute a single validated tool call.
@@ -668,17 +678,6 @@ Do not put the tool parameters at the top level.
         print(f"[Actioner] Chose: {action}")
 
         return action
-
-def _use_venv_python(self, command: str) -> str:
-    """Rewrite bare `pytest`/`python(3)` invocations to use this workspace's
-    isolated venv interpreter, so mid-run test signal matches the venv the
-    benchmark actually evaluates against."""
-    import re
-    if self.python_bin in (None, "python"):
-        return command
-    command = re.sub(r'(?<![\w./])pytest\b', f'"{self.python_bin}" -m pytest', command)
-    command = re.sub(r'(?<![\w./])python3?\b', f'"{self.python_bin}"', command)
-    return command
 
 def _extract_large_values(params: dict, threshold: int = 80) -> tuple[dict, dict]:
     safe, placeholders = {}, {}
