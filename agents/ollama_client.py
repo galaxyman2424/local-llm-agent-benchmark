@@ -10,7 +10,7 @@ class OllamaClient:
     Supports both streaming and non-streaming chat completions.
     All methods raise ``RuntimeError`` on network or server errors.
 
-    This is the SINGLE client implementation used by both the Reasoner and
+    This is the SINGLE client implementation used by both the Planner and
     the Actioner -- do not duplicate this class elsewhere. Both components
     should import it the same way::
 
@@ -59,7 +59,7 @@ class OllamaClient:
                 # mid-response) isn't a URLError -- it's a ValueError from
                 # json.loads -- so it must be caught and wrapped here too,
                 # or it propagates uncaught past every layer above that
-                # only expects RuntimeError (see Reasoner._call_model).
+                # only expects RuntimeError (see Planner._call_model).
                 snippet = raw[:200].decode("utf-8", errors="replace") if raw else "<empty body>"
                 raise RuntimeError(
                     f"Ollama returned a non-JSON/truncated response from {url}: {e} "
@@ -212,3 +212,22 @@ class OllamaClient:
     def embed(self, prompt: str) -> dict[str, Any]:
         """Embed a single prompt. Returns ``{"embedding": [...]}``."""
         return self._request("POST", "/api/embeddings", {"prompt": prompt})
+
+    def unload(self) -> None:
+        """Explicitly evict this model from Ollama's memory right now.
+
+        A ``/api/chat`` request with no messages and ``keep_alive: 0``
+        unloads the model without running any inference (this is Ollama's
+        documented pattern for on-demand unloading). Used by callers that
+        deliberately kept a model loaded indefinitely (``keep_alive=-1``,
+        e.g. to avoid relaunching it between the Planner and Actioner
+        calls of every iteration -- see ``agent.Agent``) and now want to
+        release that VRAM once they're done, rather than leaving it
+        resident until Ollama's own idle GC eventually reclaims it.
+        Errors are swallowed -- this is best-effort cleanup, not something
+        that should fail a caller's otherwise-successful run.
+        """
+        try:
+            self._request("POST", "/api/chat", {"model": self.model, "messages": [], "keep_alive": 0})
+        except RuntimeError:
+            pass

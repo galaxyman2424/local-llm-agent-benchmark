@@ -3,10 +3,10 @@
 The Actioner has two distinct responsibilities that must not blur
 together:
 
-1. ``plan_action`` -- calls an LLM to translate the Reasoner's plan into
+1. ``plan_action`` -- calls an LLM to translate the Planner's plan into
    exactly ONE concrete, schema-valid tool call. It never decides on its
    own what the overall task needs; it only operationalizes what the
-   Reasoner already decided.
+   Planner already decided.
 2. ``execute`` -- a purely deterministic executor. Given a validated tool
    call, it runs it and returns the result. It never calls an LLM.
 """
@@ -19,8 +19,8 @@ from .ollama_client import OllamaClient
 from .tool_schemas import TOOL_SCHEMAS, schema_prompt_block, validate_action
 from .json_utils import extract_json_object, repair_truncated_json
 
-# See reasoner.py's DEFAULT_NUM_CTX for why this matters: Ollama's default
-# context window is often too small once tool schemas + the Reasoner's
+# See planner.py's DEFAULT_NUM_CTX for why this matters: Ollama's default
+# context window is often too small once tool schemas + the Planner's
 # suggested parameters are embedded in the prompt, causing the model to hit
 # the context ceiling mid-JSON well before num_predict would ever apply.
 DEFAULT_NUM_CTX = 16384
@@ -458,19 +458,54 @@ class Actioner:
     def plan_action(
         self,
         task: str,
-        reasoner_plan: dict,
+        planner_plan: dict,
         previous_actions: list[dict],
+        conversation: list[dict[str, str]] | None = None,
+        keep_alive: str | int | None = 0,
+        num_ctx: int | None = None,
     ) -> dict | None:
-        """Ask the Actioner model to translate ``reasoner_plan`` into exactly
+        """Ask the Actioner model to translate ``planner_plan`` into exactly
         one concrete, schema-valid tool call.
 
         This method must NEVER independently decide what the task needs --
-        it only operationalizes the Reasoner's ``next_action`` /
+        it only operationalizes the Planner's ``next_action`` /
         ``parameters`` into the exact JSON shape the deterministic
         executor expects, resolving any ambiguity (e.g. filling in a
         workspace-relative path) without inventing new goals.
+
+        Parameters
+        ----------
+        conversation
+            When the Planner and Actioner are configured with the SAME
+            ``model_id``, the Agent passes the Planner's own conversation
+            here (its prompt plus its own reply, via
+            ``Planner.get_last_conversation()``). Instead of building a
+            brand new, disconnected prompt, this call is then sent as one
+            more turn appended to that same conversation -- the model is
+            literally continuing its own train of thought about what it
+            just decided, rather than being asked to re-derive it from a
+            fresh, isolated prompt. This also lets Ollama reuse its KV
+            cache for the shared prefix instead of reprocessing it, since
+            the model stays loaded (see ``keep_alive``) between the two
+            calls. Left as ``None`` (the default, used whenever the two
+            components run different models), behavior is unchanged from
+            before: a fresh, self-contained translation prompt.
+        keep_alive
+            Forwarded to Ollama's ``keep_alive``. Defaults to ``0``
+            (unload immediately after this call). The Agent passes a
+            non-zero/negative value together with ``conversation`` so the
+            model isn't unloaded only to be reloaded for the Planner's
+            very next call.
+        num_ctx
+            Overrides ``self.num_ctx`` for this call. Ollama keys a loaded
+            model instance by its context size among other params, so a
+            continuation call MUST request the same ``num_ctx`` the
+            Planner loaded the (shared) model with, or Ollama will reload
+            it anyway to resize the context -- defeating the point of
+            ``keep_alive``/``conversation``. The Agent passes the
+            Planner's ``num_ctx`` here whenever it passes ``conversation``.
         """
-        next_action = reasoner_plan.get("next_action", "")
+        next_action = planner_plan.get("next_action", "")
 
         # write_to_file params are stripped of large string values before
         # they ever enter the prompt (see _extract_large_values below), so
@@ -482,9 +517,9 @@ class Actioner:
         # against truncation.
         num_predict = 4096 if next_action == "write_to_file" else 512
 
-        reasoner_params = reasoner_plan.get("parameters", {}) or {}
+        planner_params = planner_plan.get("parameters", {}) or {}
 
-        # Common Reasoner confusion: it says next_action="replace_in_file" (or
+        # Common Planner confusion: it says next_action="replace_in_file" (or
         # "edit_file") but actually supplies replace_lines-shaped parameters
         # (start_line/end_line/content instead of search/replace) -- likely
         # because it knows the exact line range but reaches for the wrong
@@ -495,24 +530,24 @@ class Actioner:
         # the parameters unambiguously indicates which tool was meant, fix
         # the tool name here -- deterministically, before any LLM call --
         # rather than hoping the translation step guesses it.
-        if next_action in ("replace_in_file", "edit_file") and isinstance(reasoner_params, dict):
+        if next_action in ("replace_in_file", "edit_file") and isinstance(planner_params, dict):
             has_replace_lines_shape = (
-                "search" not in reasoner_params
-                and "start_line" in reasoner_params
-                and "end_line" in reasoner_params
+                "search" not in planner_params
+                and "start_line" in planner_params
+                and "end_line" in planner_params
             )
             if has_replace_lines_shape:
-                if "content_str" in reasoner_params and "content" not in reasoner_params:
-                    reasoner_params = dict(reasoner_params)
-                    reasoner_params["content"] = reasoner_params.pop("content_str")
-                print(f"[Actioner] Reasoner asked for '{next_action}' but supplied "
+                if "content_str" in planner_params and "content" not in planner_params:
+                    planner_params = dict(planner_params)
+                    planner_params["content"] = planner_params.pop("content_str")
+                print(f"[Actioner] Planner asked for '{next_action}' but supplied "
                       "replace_lines-shaped parameters (start_line/end_line/content) "
                       "-- correcting tool to 'replace_lines'.")
                 next_action = "replace_lines"
 
-        # Fast path: the Reasoner already gave us a valid, schema-shaped action.
+        # Fast path: the Planner already gave us a valid, schema-shaped action.
         # Don't waste a token-capped LLM call re-typing a full file body back out.
-        direct_candidate = {"tool": next_action, "parameters": reasoner_params}
+        direct_candidate = {"tool": next_action, "parameters": planner_params}
         is_valid, _ = validate_action(direct_candidate)
         if is_valid:
             print(f"[Actioner] Passthrough (no LLM call needed): {next_action}")
@@ -522,11 +557,9 @@ class Actioner:
         # out before they ever enter the prompt/generation budget, and splice
         # them back in afterward -- the Actioner model only ever has to move a
         # placeholder token around, never regenerate file content.
-        safe_params, placeholders = _extract_large_values(reasoner_params)
+        safe_params, placeholders = _extract_large_values(planner_params)
 
-        prompt = f"""You are an action executor operating inside a single, fixed workspace.
-
-You are operating in this workspace:
+        tool_call_instructions = f"""You are operating in this workspace:
 {self.workspace_dir}
 
 You MUST NOT invent a different workspace.
@@ -537,15 +570,14 @@ workspace will be rejected.
 Do not create unrelated files.
 Do not invent projects.
 
-The Reasoner has already decided WHAT should happen next. Your only job is
-to translate that decision into exactly ONE concrete tool call matching
-one of the schemas below. Do not solve the underlying task yourself, do
-not add extra steps, and do not change the Reasoner's intent.
+Your only job now is to translate that decision into exactly ONE concrete
+tool call matching one of the schemas below. Do not solve the underlying
+task yourself, do not add extra steps, and do not change your own intent.
 
-REASONER'S CHOSEN NEXT ACTION:
+CHOSEN NEXT ACTION:
 {next_action}
 
-REASONER'S SUGGESTED PARAMETERS:
+SUGGESTED PARAMETERS:
 {json.dumps(safe_params)}
 
 Available tools and their required/optional parameters:
@@ -553,7 +585,7 @@ Available tools and their required/optional parameters:
 
 Return exactly one JSON object and nothing else, no Markdown, no
 explanations, no multiple tool calls, and no large generated file
-contents unless the tool is specifically write_to_file and the Reasoner
+contents unless the tool is specifically write_to_file and you
 explicitly asked for a new file.
 
 The JSON format MUST be:
@@ -568,19 +600,48 @@ The JSON format MUST be:
 Do not put the tool parameters at the top level.
 """
 
+        if conversation:
+            # Continuation mode: same model as the Planner, still warm from
+            # that call. Append this as one more turn in the SAME
+            # conversation instead of building an isolated prompt from
+            # scratch -- the model already reasoned its way to `next_action`
+            # in its own previous turn (visible right above this one), so it
+            # only has to operationalize that choice, not re-derive it. This
+            # also lets Ollama reuse the KV cache for the shared prefix
+            # instead of reprocessing the whole thing.
+            messages = conversation + [{
+                "role": "user",
+                "content": (
+                    "Good. Now translate the decision you just made into "
+                    "exactly one concrete tool call.\n\n" + tool_call_instructions
+                ),
+            }]
+        else:
+            messages = [{
+                "role": "user",
+                "content": (
+                    "You are an action executor operating inside a single, "
+                    "fixed workspace. The Planner has already decided WHAT "
+                    "should happen next; you are translating that decision, "
+                    "not making a new one.\n\n" + tool_call_instructions
+                ),
+            }]
+
         print("=" * 20, "ACTIONER PROMPT", "=" * 20)
-        print(prompt)
+        print(f"[continuation of Planner conversation: {bool(conversation)}]")
+        print(messages[-1]["content"])
         print("=" * 60)
 
+        effective_num_ctx = num_ctx if num_ctx is not None else self.num_ctx
 
         try:
             response = self.client.chat(
-                [{"role": "user", "content": prompt}],
+                messages,
                 temperature=0.1,
                 json_mode=True,
                 num_predict=num_predict,
-                num_ctx=self.num_ctx,
-                keep_alive=0,
+                num_ctx=effective_num_ctx,
+                keep_alive=keep_alive,
                 think=False,
             )
         except RuntimeError as e:
@@ -607,7 +668,7 @@ Do not put the tool parameters at the top level.
                     action = json.loads(repaired)
                     print("[Actioner] Model reply was truncated mid-JSON (likely num_ctx too small "
                           f"for this prompt: prompt_eval_count={response.get('prompt_eval_count', '?')} "
-                          f"eval_count={response.get('eval_count', '?')} num_ctx={self.num_ctx}); "
+                          f"eval_count={response.get('eval_count', '?')} num_ctx={effective_num_ctx}); "
                           "repaired it and continuing.")
                 except json.JSONDecodeError:
                     action = None
@@ -615,7 +676,7 @@ Do not put the tool parameters at the top level.
                 print("[Actioner] Model reply contained no JSON object (and could not be repaired).")
                 print(f"[Actioner] done_reason={response.get('done_reason', '?')} "
                       f"prompt_eval_count={response.get('prompt_eval_count', '?')} "
-                      f"eval_count={response.get('eval_count', '?')} num_ctx={self.num_ctx}")
+                      f"eval_count={response.get('eval_count', '?')} num_ctx={effective_num_ctx}")
                 #print(f"[Actioner] Raw model response: {text[:2000]!r}")
                 return None
         else:

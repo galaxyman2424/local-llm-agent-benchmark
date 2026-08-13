@@ -1,10 +1,10 @@
-"""Reasoner for task analysis and planning.
+"""Planner for task analysis and planning.
 
-The Reasoner is responsible ONLY for deciding WHAT should happen next. It
+The Planner is responsible ONLY for deciding WHAT should happen next. It
 never executes tools itself -- it hands a structured plan to the Actioner,
 which turns that plan into exactly one concrete tool call
 (``Actioner.plan_action``), which the deterministic ``Actioner.execute``
-then runs. Enforcing this separation is why ``Reasoner.plan`` returns a
+then runs. Enforcing this separation is why ``Planner.plan`` returns a
 ``next_action`` / ``parameters`` / ``expected_outcome`` triple rather than
 anything that looks like an already-executed result.
 """
@@ -46,7 +46,7 @@ DEFAULT_NUM_CTX = 131072
 RISKY_CONTENT_FIELDS = ("content", "search", "replace")
 
 
-class Reasoner:
+class Planner:
     """Reasoning component that analyzes tasks and produces action plans."""
 
     def __init__(
@@ -59,6 +59,27 @@ class Reasoner:
         self.model_id = model_id
         self.timeout_seconds = timeout_seconds
         self.num_ctx = num_ctx
+
+        # Populated by every _call_model() call with the exact messages sent
+        # and the raw assistant reply received. The Agent reads these after
+        # plan() returns so that, when the Actioner is running the SAME
+        # model, it can continue this exact conversation (see
+        # Actioner.plan_action's `conversation` parameter) instead of
+        # starting a brand new, disconnected prompt -- letting the model
+        # pick up its own train of thought and letting Ollama reuse the KV
+        # cache for the shared prefix instead of reprocessing it.
+        self.last_messages: list[dict[str, str]] | None = None
+        self.last_reply: str | None = None
+
+    def get_last_conversation(self) -> list[dict[str, str]] | None:
+        """Return the full conversation (prompt + assistant reply) from the
+        most recent successful _call_model() call, suitable for handing to
+        another component that wants to continue the same chat -- or
+        ``None`` if no call has completed yet.
+        """
+        if self.last_messages is None or self.last_reply is None:
+            return None
+        return self.last_messages + [{"role": "assistant", "content": self.last_reply}]
 
     def analyze(self, task_description: str, state_context: dict[str, Any]) -> dict[str, Any]:
         """Analyze the current repository state and generate a high-level plan.
@@ -97,7 +118,8 @@ Provide your analysis as a structured JSON response with these fields:
         current_state: dict[str, Any],
         previous_actions: list[dict],
         avoid_action: tuple[str, str] | None = None,
-        stagnation_hint: str | None = None,   
+        stagnation_hint: str | None = None,
+        keep_alive: str | int | None = 0,
     ) -> dict[str, Any] | None:
 
         """Generate the next single action to take.
@@ -110,12 +132,19 @@ Provide your analysis as a structured JSON response with these fields:
             Current repository/agent state (workspace, test command, last
             result, etc.).
         previous_actions
-            Full history of ``{"iteration", "reasoner_plan", "action",
+            Full history of ``{"iteration", "planner_plan", "action",
             "result"}`` records taken so far this run.
         avoid_action
             If set, ``(tool, json_stringified_params)`` of an action the
             Agent detected repeating -- injected as a hard constraint and
             paired with a higher sampling temperature.
+        keep_alive
+            Forwarded to Ollama's ``keep_alive``. Defaults to ``0``
+            (unload immediately after this call), matching the historical
+            behavior. The Agent passes a non-zero/negative value here when
+            the Actioner is configured with the SAME model_id, so the
+            weights stay resident in VRAM instead of being unloaded only
+            to be reloaded a moment later for ``Actioner.plan_action``.
 
         Returns
         -------
@@ -272,15 +301,15 @@ Rules:
 - Keep the response concise.
 - Do not repeat the task description.
 """
-        print("=" * 20, "REASONER PROMPT", "=" * 20)
+        print("=" * 20, "PLANNER PROMPT", "=" * 20)
         print(prompt)
         print("=" * 60)
 
         temperature = 0.6 if avoid_action is not None else 0.1
 
-        result = self._call_model(prompt, temperature=temperature)
+        result = self._call_model(prompt, temperature=temperature, keep_alive=keep_alive)
         if result is None:
-            print("[Reasoner.plan] Empty/invalid model reply, retrying once with a shorter prompt.")
+            print("[Planner.plan] Empty/invalid model reply, retrying once with a shorter prompt.")
             short_prompt = f"""You are the reasoning component of a software engineering agent.
 Select exactly ONE next action as JSON: {{"next_action": "tool_name_or_done", "parameters": {{}}, "expected_outcome": "..."}}
 
@@ -290,10 +319,12 @@ Available tools:
 {schema_prompt_block()}
 
 Return only the JSON object, nothing else."""
-            result = self._call_model(short_prompt, num_predict=1024, temperature=temperature)
+            result = self._call_model(
+                short_prompt, num_predict=1024, temperature=temperature, keep_alive=keep_alive
+            )
 
         if not isinstance(result, dict):
-            print("[Reasoner.plan] No usable plan after retry; giving up for this iteration.")
+            print("[Planner.plan] No usable plan after retry; giving up for this iteration.")
             return None
 
         return {
@@ -303,7 +334,14 @@ Return only the JSON object, nothing else."""
         }
 
 
-    def _call_model(self, prompt: str, *, num_predict: int = 4096, temperature: float = 0.1) -> Any:
+    def _call_model(
+        self,
+        prompt: str,
+        *,
+        num_predict: int = 4096,
+        temperature: float = 0.1,
+        keep_alive: str | int | None = 0,
+    ) -> Any:
         """Call the reasoning model and parse its JSON reply into a dict.
 
         Returns ``None`` (rather than raising) if the model is unreachable,
@@ -312,34 +350,44 @@ Return only the JSON object, nothing else."""
         Only ``message.content`` is ever parsed as the action JSON --
         ``message.thinking`` (the model's hidden reasoning trace, when
         thinking mode is on) is never treated as the final answer.
+
+        Records the exact messages sent and the raw reply on
+        ``self.last_messages`` / ``self.last_reply`` regardless of outcome,
+        so ``get_last_conversation()`` reflects the most recent attempt --
+        overwritten if the caller (``plan``) retries with a shorter prompt.
         """
         import json as _json
 
         from .ollama_client import OllamaClient
 
+        messages = [{"role": "user", "content": prompt}]
+        self.last_messages = messages
+        self.last_reply = None
+
         client = OllamaClient(model=self.model_id, timeout_seconds=self.timeout_seconds)
         try:
             response = client.chat(
-                [{"role": "user", "content": prompt}],
+                messages,
                 temperature=temperature,
                 json_mode=True,
                 num_predict=num_predict,
                 num_ctx=self.num_ctx,
-                keep_alive=0,
+                keep_alive=keep_alive,
                 think=False,
             )
         except RuntimeError as e:
-            print(f"[Reasoner] Ollama request failed: {e}")
+            print(f"[Planner] Ollama request failed: {e}")
             return None
 
         message = response.get("message", {})
         text = message.get("content", "")
+        self.last_reply = text
 
         if not text.strip():
-            print("[Reasoner] Ollama returned an empty content response.")
-            print("[Reasoner] Done reason: {}".format(response.get("done_reason", "unknown")))
-            #print("[Reasoner] Thinking length: {}".format(len(message.get("thinking", "") or "")))
-            #print("[Reasoner] prompt_eval_count={} eval_count={} (if eval_count is near num_predict "
+            print("[Planner] Ollama returned an empty content response.")
+            print("[Planner] Done reason: {}".format(response.get("done_reason", "unknown")))
+            #print("[Planner] Thinking length: {}".format(len(message.get("thinking", "") or "")))
+            #print("[Planner] prompt_eval_count={} eval_count={} (if eval_count is near num_predict "
                   #"or prompt_eval_count+eval_count is near num_ctx={}, the context window is too "
                   #"small for this prompt).".format(
                       #response.get("prompt_eval_count", "?"), response.get("eval_count", "?"), self.num_ctx))
@@ -370,30 +418,30 @@ Return only the JSON object, nothing else."""
                         # Treat this exactly like an unparseable reply so the
                         # caller's existing short-prompt retry kicks in,
                         # instead of returning a plan we can't trust.
-                        print("[Reasoner] Model reply was truncated mid-JSON while "
+                        print("[Planner] Model reply was truncated mid-JSON while "
                               "generating a file-content field (content/search/"
                               "replace) -- refusing to trust the repaired value "
                               "since it may be silently truncated code. Treating "
                               "this call as failed so it gets retried.")
                         return None
 
-                    print("[Reasoner] Model reply was truncated mid-JSON (likely num_ctx too small "
+                    print("[Planner] Model reply was truncated mid-JSON (likely num_ctx too small "
                           f"for this prompt: prompt_eval_count={response.get('prompt_eval_count', '?')} "
                           f"eval_count={response.get('eval_count', '?')} num_ctx={self.num_ctx}); "
                           "repaired it and continuing.")
                     return parsed
 
-            print("[Reasoner] Model reply contained no JSON object (and could not be repaired)")
-            print(f"[Reasoner] done_reason={response.get('done_reason', '?')} "
+            print("[Planner] Model reply contained no JSON object (and could not be repaired)")
+            print(f"[Planner] done_reason={response.get('done_reason', '?')} "
                   f"prompt_eval_count={response.get('prompt_eval_count', '?')} "
                   f"eval_count={response.get('eval_count', '?')} num_ctx={self.num_ctx}")
-            print("[Reasoner] Raw model response:")
+            print("[Planner] Raw model response:")
             #print(repr(text[:2000]))
             return None
         try:
             return _json.loads(candidate)
         except _json.JSONDecodeError as e:
-            print(f"[Reasoner] Model reply was not valid JSON: {e}")
+            print(f"[Planner] Model reply was not valid JSON: {e}")
             return None
 
 
@@ -447,7 +495,7 @@ def _format_previous_actions(
 
 def _loop_warning(previous_actions: list[dict]) -> str:
     """Detect immediate repetition of the same (tool, parameters) action and
-    inject explicit feedback telling the Reasoner it must change course.
+    inject explicit feedback telling the Planner it must change course.
     """
     if len(previous_actions) < REPEATED_ACTION_THRESHOLD:
         return ""
@@ -482,7 +530,7 @@ def _tests_passed(previous_actions: list[dict]) -> bool:
     """Whether the MOST RECENT run_tests action passed -- not whether any
     run_tests action ever passed at some earlier point. A later edit could
     have broken something after an earlier passing run, so scanning for
-    "any pass in history" would wrongly let the Reasoner declare "done"
+    "any pass in history" would wrongly let the Planner declare "done"
     on a since-regressed fix.
     """
     for record in reversed(previous_actions):
@@ -506,9 +554,9 @@ def _format_file_cache(
     max_file_chars: int = 32000,
     max_total_chars: int = 120000,
 ) -> str:
-    """Render cached file contents for the Reasoner prompt.
+    """Render cached file contents for the Planner prompt.
 
-    The Reasoner gets actual file contents instead of only a list of paths.
+    The Planner gets actual file contents instead of only a list of paths.
     Individual files and the total cache are capped to avoid exhausting the
     model's context window. Partial reads are rendered as line-range chunks.
     """
@@ -610,7 +658,7 @@ def _repair_touches_risky_field(parsed: Any) -> bool:
     """True if a (successfully re-parsed) repaired plan sets any of the
     file-content fields in RISKY_CONTENT_FIELDS.
 
-    Used only on the repair path in ``Reasoner._call_model`` -- a plan that
+    Used only on the repair path in ``Planner._call_model`` -- a plan that
     parsed cleanly on the first try (no repair needed) is never subject to
     this check, since there was nothing to silently truncate.
     """
