@@ -1,8 +1,8 @@
-"""Run every reasoner x actioner combination from models.txt through SWE-bench
+"""Run every planner x actioner combination from models.txt through SWE-bench
 and rank them by resolve rate.
 
 This reuses experiments/run_experiment.py's run_experiment() for each
-combination (passing reasoner_model/actioner_model overrides so we don't
+combination (passing planner_model/actioner_model overrides so we don't
 need a separate YAML config file per pairing), then builds a leaderboard
 from all the resulting summaries.
 
@@ -11,11 +11,11 @@ Example usage::
     # See what would run without actually running anything
     python experiments/run_grid_search.py --dry-run
 
-    # Run the full grid (every reasoner x actioner pair) against 5 instances
+    # Run the full grid (every planner x actioner pair) against 5 instances
     python experiments/run_grid_search.py --limit 5
 
     # Use a different base config for shared agent/runtime settings
-    # (models.txt still decides which reasoner/actioner models are tried)
+    # (models.txt still decides which planner/actioner models are tried)
     python experiments/run_grid_search.py --config configs/qwen_deepseek.yaml
 """
 
@@ -54,7 +54,7 @@ def run_grid_search(
     pure_python_only: bool = False,
     use_docker: bool = False,
 ) -> list[dict]:
-    """Run (or preview) every reasoner x actioner combination.
+    """Run (or preview) every planner x actioner combination.
 
     Parameters
     ----------
@@ -62,7 +62,7 @@ def run_grid_search(
         Path to the models.txt roster (see experiments/model_roster.py).
     config_path :
         Base YAML config supplying shared settings (max_iterations, etc.);
-        its own reasoner/actioner models are ignored in favor of each grid
+        its own planner/actioner models are ignored in favor of each grid
         combination.
     limit :
         Number of SWE-bench instances to run per combination. Keep this
@@ -75,7 +75,7 @@ def run_grid_search(
         committing to a potentially long grid search.
     repo_filter, pure_python_only :
         Passed straight through to :func:`run_experiment` -- lets you grid-
-        search reasoner/actioner combinations against a cheap, fast-
+        search planner/actioner combinations against a cheap, fast-
         iterating subset of instances (e.g. skipping astropy/scikit-learn-
         style C-extension builds) before committing to the full dataset.
 
@@ -84,19 +84,19 @@ def run_grid_search(
     list[dict]
         One summary dict per combination, sorted by resolve_rate descending
         (best first). Each combination's full summary is also written to
-        ``results_processed_dir/<reasoner>__<actioner>.json``, and the
+        ``results_processed_dir/<planner>__<actioner>.json``, and the
         whole leaderboard to ``results_processed_dir/leaderboard.json``.
     """
     roster = load_model_roster(models_path)
-    reasoners = roster["reasoners"]
+    planners = roster["planners"]
     actioners = roster["actioners"]
-    combinations = list(itertools.product(reasoners, actioners))
+    combinations = list(itertools.product(planners, actioners))
 
     print(f"[GridSearch] Loaded roster from {models_path}: "
-          f"{len(reasoners)} reasoner(s) x {len(actioners)} actioner(s) "
+          f"{len(planners)} planner(s) x {len(actioners)} actioner(s) "
           f"= {len(combinations)} combination(s)")
-    for reasoner_model, actioner_model in combinations:
-        print(f"  - reasoner={reasoner_model:<40} actioner={actioner_model}")
+    for planner_model, actioner_model in combinations:
+        print(f"  - planner={planner_model:<40} actioner={actioner_model}")
 
     if dry_run:
         instances_note = "all available" if limit is None else str(limit)
@@ -111,11 +111,11 @@ def run_grid_search(
     leaderboard: list[dict] = []
     grid_start = time.time()
 
-    for i, (reasoner_model, actioner_model) in enumerate(combinations):
-        run_name = f"{_slugify(reasoner_model)}__{_slugify(actioner_model)}"
+    for i, (planner_model, actioner_model) in enumerate(combinations):
+        run_name = f"{_slugify(planner_model)}__{_slugify(actioner_model)}"
         print(f"\n{'#'*70}")
         print(f"[GridSearch] Combination {i+1}/{len(combinations)}: "
-              f"reasoner={reasoner_model} actioner={actioner_model}")
+              f"planner={planner_model} actioner={actioner_model}")
         print(f"{'#'*70}")
 
         try:
@@ -125,7 +125,7 @@ def run_grid_search(
                 seed_repos_dir=seed_repos_dir,
                 results_raw_dir=str(Path(results_raw_dir) / run_name),
                 results_processed_dir=str(results_processed_dir),
-                reasoner_model=reasoner_model,
+                planner_model=planner_model,
                 actioner_model=actioner_model,
                 run_name=run_name,
                 repo_filter=repo_filter,
@@ -135,7 +135,7 @@ def run_grid_search(
         except Exception as e:
             print(f"[GridSearch] Combination {run_name} FAILED: {e}")
             summary = {
-                "reasoner_model": reasoner_model,
+                "planner_model": planner_model,
                 "actioner_model": actioner_model,
                 "total_instances": 0,
                 "resolved": 0,
@@ -182,7 +182,7 @@ def _print_leaderboard(leaderboard: list[dict]) -> None:
         print("[GridSearch] No results to show.")
         return
 
-    header = f"{'rank':<5}{'reasoner':<28}{'actioner':<38}{'resolved':<10}{'rate':<8}{'errors':<8}"
+    header = f"{'rank':<5}{'planner':<28}{'actioner':<38}{'resolved':<10}{'rate':<8}{'errors':<8}"
     print(header)
     print("-" * len(header))
     for rank, s in enumerate(leaderboard, start=1):
@@ -191,14 +191,14 @@ def _print_leaderboard(leaderboard: list[dict]) -> None:
         rate = s.get("resolve_rate", 0.0)
         errors = s.get("errors", 0)
         print(
-            f"{rank:<5}{s.get('reasoner_model', '?'):<28}{s.get('actioner_model', '?'):<38}"
+            f"{rank:<5}{s.get('planner_model', '?'):<28}{s.get('actioner_model', '?'):<38}"
             f"{f'{resolved}/{total}':<10}{f'{rate:.1%}':<8}{errors:<8}"
         )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run every reasoner x actioner combination from models.txt through SWE-bench"
+        description="Run every planner x actioner combination from models.txt through SWE-bench"
     )
     parser.add_argument("--models", type=str, default="models.txt", help="Path to models.txt roster")
     parser.add_argument("--config", type=str, default="configs/qwen_ornith.yaml",

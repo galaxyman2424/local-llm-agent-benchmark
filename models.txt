@@ -35,9 +35,8 @@
 # Format: one model id per line under each [section] header. Lines starting
 # with # are comments and blank lines are ignored.
 
-[reasoners]
-gemma4:26b-a4b-it-q4_K_M
-
+[planners]
+qwen3.5:9b
 
 [actioners]
-gemma4:26b-a4b-it-q4_K_M
+qwen3.5:9b

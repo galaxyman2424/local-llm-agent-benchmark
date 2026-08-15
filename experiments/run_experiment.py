@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 def _write_running_summary(
     summary_path: Path,
     config_path: str,
-    reasoner_model: str,
+    planner_model: str,
     actioner_model: str,
     results: list,
     total_instances: int,
@@ -35,7 +35,7 @@ def _write_running_summary(
 
     partial_summary = {
         "experiment_config": config_path,
-        "reasoner_model": reasoner_model,
+        "planner_model": planner_model,
         "actioner_model": actioner_model,
         "completed_instances": completed,
         "total_instances": total_instances,
@@ -80,7 +80,7 @@ def run_experiment(
     seed_repos_dir: str = "seed_repos/swe_bench_lite",
     results_raw_dir: str = "results/raw",
     results_processed_dir: str = "results/processed",
-    reasoner_model: str | None = None,
+    planner_model: str | None = None,
     actioner_model: str | None = None,
     run_name: str | None = None,
     repo_filter: str | None = None,
@@ -92,7 +92,7 @@ def run_experiment(
 
     Steps:
       1. Load configuration from YAML file
-      2. Initialize agents (Reasoner, Actioner, Agent controller)
+      2. Initialize agents (Planner, Actioner, Agent controller)
       3. Initialize SWE-bench benchmark
       4. Select instances (optionally limited by --limit)
       5. Run the benchmark on each instance
@@ -103,7 +103,7 @@ def run_experiment(
     ----------
     config_path : str
         Path to the YAML configuration file. Still used for agent/benchmark
-        settings (max_iterations, etc.) even if reasoner_model/actioner_model
+        settings (max_iterations, etc.) even if planner_model/actioner_model
         override the model names it specifies.
     limit : int | None
         Number of instances to evaluate. If None, all instances are run.
@@ -113,9 +113,9 @@ def run_experiment(
         Where per-instance raw results are saved.
     results_processed_dir : str
         Where aggregated summaries are saved.
-    reasoner_model : str | None
-        If given, overrides the config file's reasoner model (useful for
-        grid-searching many reasoner/actioner pairings without writing a
+    planner_model : str | None
+        If given, overrides the config file's planner model (useful for
+        grid-searching many planner/actioner pairings without writing a
         YAML file per combination).
     actioner_model : str | None
         Same as above, for the actioner model.
@@ -126,7 +126,7 @@ def run_experiment(
     repo_filter : str | None
         If given, only run instances whose ``repo`` field contains this
         substring (case-insensitive), e.g. ``"requests"``. Lets you prove
-        out the Reasoner/Actioner architecture on a specific repo before
+        out the Planner/Actioner architecture on a specific repo before
         paying the environment-setup cost of the full grid.
     pure_python_only : bool
         If True, restrict to the subset of SWE-bench Lite repos that don't
@@ -189,8 +189,8 @@ def run_experiment(
     dataset = {"instances": {inst.get("instance_id", f"instance_{i}"): inst for i, inst in enumerate(dataset_list)}}
 
     # Initialize agents (explicit overrides win over the config file)
-    from agents import Reasoner, Actioner, Agent
-    reasoner_model = reasoner_model or config.get("reasoner", {}).get("model", "qwen3.5:9b")
+    from agents import Planner, Actioner, Agent
+    planner_model = planner_model or config.get("planner", {}).get("model", "qwen3.5:9b")
     actioner_model = actioner_model or config.get("actioner", {}).get("model", "ornith:9b")
 
     # NOTE: these are per-LLM-request timeouts (how long a single Ollama
@@ -198,20 +198,20 @@ def run_experiment(
     # (the budget for the WHOLE task across all iterations). Conflating
     # the two meant a 600s "agent timeout" was silently being used as a
     # 120s single-request timeout, or vice versa.
-    reasoner_timeout = config.get("reasoner", {}).get("timeout_seconds", 120.0)
+    planner_timeout = config.get("planner", {}).get("timeout_seconds", 120.0)
     actioner_timeout = config.get("actioner", {}).get("timeout_seconds", 120.0)
 
     # num_ctx (context window) is a SEPARATE knob from num_predict -- see
-    # agents/reasoner.py's DEFAULT_NUM_CTX docstring. Too small a value here
+    # agents/planner.py's DEFAULT_NUM_CTX docstring. Too small a value here
     # is the actual cause of replies truncating mid-JSON, not num_predict.
-    reasoner_num_ctx = config.get("reasoner", {}).get("num_ctx")
+    planner_num_ctx = config.get("planner", {}).get("num_ctx")
     actioner_num_ctx = config.get("actioner", {}).get("num_ctx")
 
     actioner_max_read_lines = config.get("actioner", {}).get("max_read_lines", 300)
 
-    print(f"[Experiment] Initializing Reasoner (model={reasoner_model}, request_timeout={reasoner_timeout}s, "
-          f"num_ctx={reasoner_num_ctx})...")
-    reasoner = Reasoner(model_id=reasoner_model, timeout_seconds=reasoner_timeout, num_ctx=reasoner_num_ctx)
+    print(f"[Experiment] Initializing Planner (model={planner_model}, request_timeout={planner_timeout}s, "
+          f"num_ctx={planner_num_ctx})...")
+    planner = Planner(model_id=planner_model, timeout_seconds=planner_timeout, num_ctx=planner_num_ctx)
 
     print(f"[Experiment] Initializing Actioner (model={actioner_model}, request_timeout={actioner_timeout}s, "
         f"num_ctx={actioner_num_ctx}, max_read_lines={actioner_max_read_lines})...")
@@ -226,7 +226,7 @@ def run_experiment(
     agent_timeout = config.get("agent", {}).get("timeout_seconds", None)
     print(f"[Experiment] Agent max iterations: {agent_max_iter}")
     print(f"[Experiment] Agent timeout: {agent_timeout}s")
-    agent = Agent(reasoner, actioner, max_iterations=agent_max_iter, timeout=agent_timeout)
+    agent = Agent(planner, actioner, max_iterations=agent_max_iter, timeout=agent_timeout)
 
     # Get benchmark object
     from benchmarks import SWEbenchBenchmark
@@ -285,7 +285,7 @@ def run_experiment(
             result = benchmark.run_instance(
                 task=task,
                 agent=agent,
-                reasoner_model=reasoner_model,
+                planner_model=planner_model,
                 actioner_model=actioner_model,
                 use_docker=use_docker,
             )
@@ -309,7 +309,7 @@ def run_experiment(
         results_processed_dir.mkdir(parents=True, exist_ok=True)
         summary_stem = run_name or Path(config_path).stem
         summary_path = results_processed_dir / f"{summary_stem}.json"
-        _write_running_summary(summary_path, config_path, reasoner_model,
+        _write_running_summary(summary_path, config_path, planner_model,
                                 actioner_model, results, len(selected_instances),
                                 time.time() - start_time)
 
@@ -354,7 +354,7 @@ def run_experiment(
 
     summary = {
         "experiment_config": config_path,
-        "reasoner_model": reasoner_model,
+        "planner_model": planner_model,
         "actioner_model": actioner_model,
         "total_instances": total,
         "resolved": resolved,
@@ -383,7 +383,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a complete experiment from config file")
     parser.add_argument("--config", type=str, default="configs/qwen_ornith.yaml")
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--reasoner-model", type=str, default=None, help="Override the config's reasoner model")
+    parser.add_argument("--planner-model", type=str, default=None, help="Override the config's planner model")
     parser.add_argument("--actioner-model", type=str, default=None, help="Override the config's actioner model")
     parser.add_argument("--run-name", type=str, default=None, help="Summary filename stem (default: config file stem)")
     parser.add_argument("--repo-filter", type=str, default=None,
@@ -402,7 +402,7 @@ if __name__ == "__main__":
     result = run_experiment(
         config_path=args.config,
         limit=args.limit,
-        reasoner_model=args.reasoner_model,
+        planner_model=args.planner_model,
         actioner_model=args.actioner_model,
         run_name=args.run_name,
         repo_filter=args.repo_filter,

@@ -687,6 +687,18 @@ Do not put the tool parameters at the top level.
                 print(f"[Actioner] Raw candidate: {candidate[:2000]!r}")
                 return None
 
+        # Normalize: small models occasionally echo the Planner's own field
+        # name ("next_action", or sometimes just "action") instead of the
+        # Actioner schema's "tool" key -- json_mode only guarantees valid
+        # JSON, not the right key names. Do this BEFORE the "parameters at
+        # top level" fold below, since that fold keys off action["tool"]
+        # and would otherwise silently no-op whenever "tool" is missing.
+        if isinstance(action, dict) and "tool" not in action:
+            for alias in ("next_action", "action", "tool_name"):
+                if alias in action and isinstance(action[alias], str):
+                    action["tool"] = action.pop(alias)
+                    break
+
         # Normalize: some models put parameters at the top level despite
         # instructions. Fold any recognized required/optional keys for the
         # named tool into `parameters` if `parameters` itself is missing.

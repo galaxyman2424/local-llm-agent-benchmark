@@ -16,7 +16,7 @@ class InstanceRecord:
     repo_name: str = ""
     base_commit: str = ""
     agent_config: dict = field(default_factory=dict)
-    reasoner_model: str = ""
+    planner_model: str = ""
     actioner_model: str = ""
     start_time: float = 0.0
     end_time: float = 0.0
@@ -34,7 +34,7 @@ class InstanceRecord:
     pass_to_pass_results: dict = field(default_factory=dict)
 
     stop_reason: str = ""
-    last_reasoner_plan: dict = field(default_factory=dict)
+    last_planner_plan: dict = field(default_factory=dict)
     last_action: dict = field(default_factory=dict)
     last_result: dict = field(default_factory=dict)
     history: list = field(default_factory=list)
@@ -105,7 +105,7 @@ class SWEbenchBenchmark:
         self,
         task: dict,
         agent,
-        reasoner_model: str | None = None,
+        planner_model: str | None = None,
         actioner_model: str | None = None,
         use_docker: bool = False,
     ) -> InstanceRecord:
@@ -124,7 +124,7 @@ class SWEbenchBenchmark:
             instance_id=task.get("instance_id", ""),
             repo_name=repo_name,
             base_commit=base_commit,
-            reasoner_model=reasoner_model or "qwen2.5:7b",
+            planner_model=planner_model or "qwen2.5:7b",
             actioner_model=actioner_model or "qwen2.5:7b",
         )
 
@@ -190,7 +190,7 @@ class SWEbenchBenchmark:
             record.stop_reason = getattr(agent_result, "stop_reason", "") or ""
             record.last_action = getattr(agent_result, "last_action", {}) or {}
             record.last_result = getattr(agent_result, "last_result", {}) or {}
-            record.last_reasoner_plan = getattr(agent_result, "last_reasoner_plan", {}) or {}
+            record.last_planner_plan = getattr(agent_result, "last_planner_plan", {}) or {}
             record.history = getattr(agent_result, "history", []) or []
             record.num_iterations = getattr(agent_result, "num_iterations", 0) or 0
             record.total_tool_calls = getattr(agent_result, "total_tool_calls", 0) or 0
@@ -311,7 +311,7 @@ class SWEbenchBenchmark:
                 "num_iterations": r.num_iterations,
                 "total_tool_calls": r.total_tool_calls,
                 "last_tool": (r.last_action or {}).get("tool"),
-                "last_expected_outcome": (r.last_reasoner_plan or {}).get("expected_outcome", ""),
+                "last_expected_outcome": (r.last_planner_plan or {}).get("expected_outcome", ""),
                 "fail_to_pass": f"{r.fail_to_pass_count}/{r.fail_to_pass_total}" if r.fail_to_pass_total else None,
                 "pass_to_pass": f"{r.pass_to_pass_count}/{r.pass_to_pass_total}" if r.pass_to_pass_total else None,
             }

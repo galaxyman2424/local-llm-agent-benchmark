@@ -1,9 +1,9 @@
-"""Parse the project's models.txt roster into reasoner/actioner model lists.
+"""Parse the project's models.txt roster into planner/actioner model lists.
 
 models.txt (in the project root) separates locally-available Ollama models
 into two roles:
 
-    [reasoners]
+    [planners]
     qwen3.5:9b
     ...
 
@@ -12,7 +12,7 @@ into two roles:
     ...
 
 This module just parses that file; experiments/run_grid_search.py uses it to
-build every reasoner x actioner combination to benchmark.
+build every planner x actioner combination to benchmark.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from pathlib import Path
 
 
 def load_model_roster(path: str | Path = "models.txt") -> dict[str, list[str]]:
-    """Parse models.txt into ``{"reasoners": [...], "actioners": [...]}``.
+    """Parse models.txt into ``{"planners": [...], "actioners": [...]}``.
 
     Blank lines and lines starting with ``#`` are ignored. A ``[section]``
     header switches which list subsequent model lines are appended to.
@@ -35,17 +35,17 @@ def load_model_roster(path: str | Path = "models.txt") -> dict[str, list[str]]:
     FileNotFoundError
         If ``path`` doesn't exist.
     ValueError
-        If neither a ``[reasoners]`` nor ``[actioners]`` section was found
+        If neither a ``[planners]`` nor ``[actioners]`` section was found
         at all (most likely the file wasn't edited yet, or is malformed).
     """
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(
             f"Model roster not found at {path}. Expected a models.txt with "
-            "[reasoners] and [actioners] sections in the project root."
+            "[planners] and [actioners] sections in the project root."
         )
 
-    roster: dict[str, list[str]] = {"reasoners": [], "actioners": []}
+    roster: dict[str, list[str]] = {"planners": [], "actioners": []}
     current_section: str | None = None
 
     for raw_line in path.read_text().splitlines():
@@ -59,10 +59,10 @@ def load_model_roster(path: str | Path = "models.txt") -> dict[str, list[str]]:
         if current_section is not None:
             roster[current_section].append(line)
 
-    if not roster["reasoners"] and not roster["actioners"]:
+    if not roster["planners"] and not roster["actioners"]:
         raise ValueError(
-            f"No [reasoners] or [actioners] entries found in {path}. "
-            "Check the file has section headers like '[reasoners]' followed "
+            f"No [planners] or [actioners] entries found in {path}. "
+            "Check the file has section headers like '[planners]' followed "
             "by one model id per line."
         )
 
@@ -76,5 +76,5 @@ if __name__ == "__main__":
     roster_path = sys.argv[1] if len(sys.argv) > 1 else "models.txt"
     roster = load_model_roster(roster_path)
     print(json.dumps(roster, indent=2))
-    print(f"\n{len(roster['reasoners'])} reasoner(s) x {len(roster['actioners'])} actioner(s) "
-          f"= {len(roster['reasoners']) * len(roster['actioners'])} combinations")
+    print(f"\n{len(roster['planners'])} planner(s) x {len(roster['actioners'])} actioner(s) "
+          f"= {len(roster['planners']) * len(roster['actioners'])} combinations")

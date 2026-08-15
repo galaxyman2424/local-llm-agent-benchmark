@@ -1,12 +1,12 @@
 from .ollama_client import OllamaClient
-from .reasoner import Reasoner
+from .planner import Planner
 from .actioner import Actioner
 from .agent import Agent, AgentResult
 from .tool_schemas import TOOL_SCHEMAS, validate_action
 
 __all__ = [
     "OllamaClient",
-    "Reasoner",
+    "Planner",
     "Actioner",
     "Agent",
     "AgentResult",
